@@ -1,0 +1,36 @@
+VERDICT: REJECTED
+VERDICT: REJECTED
+
+The documented/default training configuration is internally inconsistent and cannot execute the stated pipeline. `configs/experiment.toml` selects a 128KB payload (1,048,576 bits) but fixes the encoder `payload_dim` to 8,192; the first training forward raises the encoder’s payload-shape validation error. The same configuration describes 8,192 as matching 128KB, which is factually incorrect. The test suite only exercises 64-bit payloads on test-only tiny backbones, so it does not cover the shipped configuration.
+
+The train CLI also contradicts its promised precedence: every value is resolved as `config value` before `CLI argument`, so supplied flags such as `--host-model`, `--epochs`, and `--payload-size` do not override a TOML config. This prevents users from correcting the broken config at invocation time and makes the documented command behavior unreliable.
+
+`pytest -q` passes (157 tests), but that is insufficient evidence because no test smoke-runs the committed TOML/default CLI path at a supported payload size.
+
+Security: none observed. The flagged checkpoint loads use `weights_only=True`, which addresses the relevant pickle-deserialization risk.
+
+Next actions:
+1. Make payload sizing coherent end-to-end: derive encoder payload dimension from the selected payload size (or validate and reject mismatches before training) and correct the TOML documentation/defaults.
+2. Implement genuine CLI-over-config precedence, typically by using `None` parser defaults and applying only explicitly supplied CLI values.
+3. Add a configuration/CLI integration test that resolves the shipped TOML and verifies a supported payload reaches pipeline construction/forward with matching dimensions.
+
+Memory note: the new memory entries are largely code-derivable implementation/debugging recipes; retain only durable architectural decisions rather than file/function-specific instructions.
+
+VERDICT: REJECTED
+
+The documented/default training configuration is internally inconsistent and cannot execute the stated pipeline. `configs/experiment.toml` selects a 128KB payload (1,048,576 bits) but fixes the encoder `payload_dim` to 8,192; the first training forward raises the encoder’s payload-shape validation error. The same configuration describes 8,192 as matching 128KB, which is factually incorrect. The test suite only exercises 64-bit payloads on test-only tiny backbones, so it does not cover the shipped configuration.
+
+The train CLI also contradicts its promised precedence: every value is resolved as `config value` before `CLI argument`, so supplied flags such as `--host-model`, `--epochs`, and `--payload-size` do not override a TOML config. This prevents users from correcting the broken config at invocation time and makes the documented command behavior unreliable.
+
+`pytest -q` passes (157 tests), but that is insufficient evidence because no test smoke-runs the committed TOML/default CLI path at a supported payload size.
+
+Security: none observed. The flagged checkpoint loads use `weights_only=True`, which addresses the relevant pickle-deserialization risk.
+
+Next actions:
+1. Make payload sizing coherent end-to-end: derive encoder payload dimension from the selected payload size (or validate and reject mismatches before training) and correct the TOML documentation/defaults.
+2. Implement genuine CLI-over-config precedence, typically by using `None` parser defaults and applying only explicitly supplied CLI values.
+3. Add a configuration/CLI integration test that resolves the shipped TOML and verifies a supported payload reaches pipeline construction/forward with matching dimensions.
+
+Memory note: the new memory entries are largely code-derivable implementation/debugging recipes; retain only durable architectural decisions rather than file/function-specific instructions.
+
+VERDICT: REJECTED

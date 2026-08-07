@@ -1,0 +1,43 @@
+# Primary environment for reproducing all paper experiments and plots.
+# For MaleficNet attack regeneration (D4 dataset), use requirements-maleficnet.txt
+# in a separate Python env (its upstream deps conflict with the stack below).
+#
+# Tested with Python 3.11.9 on Ubuntu 20.04, CUDA 11.8.
+
+# Deep learning
+# Use plain `tensorflow` (CPU + auto-detect GPU) instead of `tensorflow[and-cuda]`
+# to avoid an nvidia-cublas-cu12 conflict with torch 2.4's pinned CUDA wheels.
+# If you need TF on GPU, install nvidia drivers + cudnn separately, or replace
+# this line with `tensorflow[and-cuda]==2.15.1` and uninstall the conflicting torch wheels.
+tensorflow==2.15.1
+torch==2.4.0
+torchvision==0.19.0
+torchaudio==2.4.0
+keras==2.15.0
+
+# Classical ML / numerics
+numpy==1.26.4
+scipy==1.14.0
+scikit-learn==1.5.1
+xgboost==2.1.1
+
+# Data / IO
+pandas==2.2.2
+pydantic==2.7.1
+h5py==3.11.0
+
+# Image handling
+pillow==10.4.0
+scikit-image==0.24.0
+
+# Plotting
+matplotlib==3.9.1.post1
+seaborn==0.13.2
+
+# Hugging Face (cover_data_procs.pretrained_model HF branch)
+transformers==4.31.0
+huggingface-hub==0.24.5
+
+# Misc
+tqdm==4.66.5
+bitstring==4.2.3

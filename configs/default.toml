@@ -1,0 +1,30 @@
+[project]
+name = "adaptive-model-steganography-research"
+purpose = "defensive-ai-security-research"
+
+[safety]
+payload_type = "benign_random"
+allow_malware_generation = false
+allow_malware_execution = false
+
+[runtime]
+python_version = "3.11"
+device = "auto"
+seed = 42
+
+[outputs]
+root = "outputs"
+logs = "outputs/logs"
+figures = "outputs/figures"
+metrics = "outputs/metrics"
+checkpoints = "outputs/checkpoints"
+
+[research]
+host_models = ["resnet18", "resnet50", "mobilenet_v2", "vgg16"]
+metrics = [
+    "accuracy_drop",
+    "payload_recovery",
+    "bit_error_rate",
+    "model_xray_detection_rate",
+    "embedding_capacity",
+]

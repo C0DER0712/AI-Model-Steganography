@@ -1,0 +1,213 @@
+# Full experiment configuration for the steganographic embedding pipeline.
+# CLI flags in scripts/train.py and scripts/evaluate.py override these values.
+
+[project]
+name = "adaptive-model-steganography-research"
+purpose = "defensive-ai-security-research"
+
+[safety]
+payload_type = "benign_random"
+allow_malware_generation = false
+allow_malware_execution = false
+
+# ---------------------------------------------------------------------------
+# Runtime
+# ---------------------------------------------------------------------------
+
+[runtime]
+device = "auto"          # "auto" | "cpu" | "cuda" | "mps"
+seed   = 42
+python_version = "3.11"
+
+# ---------------------------------------------------------------------------
+# Data
+# ---------------------------------------------------------------------------
+
+[data]
+# Payload size embedded into each host model.
+# Must be one of: "128KB", "256KB", "512KB", "1MB".
+payload_size = "128KB"
+
+# Number of synthetic training samples when no real dataset is provided.
+synthetic_samples = 512
+
+# Fraction reserved for validation.
+val_split = 0.1
+
+# DataLoader workers (0 = main process only, safe for all platforms).
+num_workers = 0
+
+# ---------------------------------------------------------------------------
+# Host model
+# ---------------------------------------------------------------------------
+
+[host_model]
+# One of: "resnet18", "resnet50", "mobilenet_v2", "vgg16".
+name = "resnet18"
+
+# Number of classification output classes (1000 = ImageNet).
+num_classes = 1000
+
+# Load official pretrained ImageNet weights.
+pretrained = false
+
+# Allow the host model to be fine-tuned alongside encoder/decoder.
+train_host_model = false
+
+# ---------------------------------------------------------------------------
+# Encoder architecture
+# ---------------------------------------------------------------------------
+
+[encoder]
+# NOTE: payload_dim is automatically derived from data.payload_size at runtime.
+# Do NOT set payload_dim here — any value is ignored by scripts/train.py.
+# payload_dim = <auto>  →  SUPPORTED_PAYLOAD_SIZES[payload_size] * 8
+input_channels       = 4
+output_channels      = 4
+base_channels        = 64
+num_residual_blocks  = 4
+payload_embedding_dim = 256
+# Width of the shared linear layer used to embed each payload chunk.
+# Independent of payload_dim by design — this is what keeps parameter count
+# small regardless of payload size (see models/encoder.py::PayloadEncoder).
+payload_chunk_size   = 1024
+attention_reduction  = 8
+dropout              = 0.0
+max_delta            = 1.0
+
+# ---------------------------------------------------------------------------
+# Decoder architecture
+# ---------------------------------------------------------------------------
+
+[decoder]
+# Number of payload bits reconstructed per shared ChunkHead call. Independent
+# of payload size by design — ChunkedPayloadDecoder applies this SAME small
+# head across ceil(payload_bits / chunk_size) chunks. Do not set this equal
+# to the full payload length; that collapses chunking into one dense
+# hidden_dim x payload_bits layer (hundreds of millions of params for large
+# payloads).
+chunk_size         = 1024
+input_channels     = 4
+base_channels      = 64
+num_residual_blocks = 4
+attention_reduction = 8
+chunk_position_dim = 64
+hidden_dim         = 256
+dropout            = 0.0
+
+# ---------------------------------------------------------------------------
+# Differentiable (frozen) detector architecture
+# ---------------------------------------------------------------------------
+
+[detector]
+input_channels       = 4
+hpf_channels         = 30
+base_channels        = 32
+num_type1_blocks     = 4
+num_type2_blocks     = 3
+truncation_threshold = 3.0
+fc_hidden_dim        = 128
+dropout              = 0.5
+
+# ---------------------------------------------------------------------------
+# Training objectives
+# The four loss weights correspond to the research objective:
+#   L = α * classification + β * payload + γ * distortion + δ * detector
+# ---------------------------------------------------------------------------
+
+[loss_weights]
+alpha = 1.0   # Host model accuracy preservation
+beta  = 1.0   # Payload recovery
+gamma = 1.0   # Weight-representation distortion (stealth)
+delta = 1.0   # Frozen detector evasion
+
+# ---------------------------------------------------------------------------
+# Training loop
+# ---------------------------------------------------------------------------
+
+[training]
+max_epochs            = 50
+batch_size            = 16
+learning_rate         = 1.0e-4
+weight_decay          = 1.0e-5
+gradient_clip_norm    = 1.0
+mixed_precision       = false
+
+# LR scheduler: "cosine" | "step" | "reduce_on_plateau"
+scheduler             = "cosine"
+scheduler_t_max       = 50      # CosineAnnealingLR period
+scheduler_step_size   = 10      # StepLR step
+scheduler_gamma       = 0.5     # StepLR / ReduceLROnPlateau decay factor
+
+# Set to null to disable early stopping.
+early_stopping_patience = 10
+
+log_every_n_steps     = 10
+save_best_only        = false
+
+# ---------------------------------------------------------------------------
+# Outputs
+# ---------------------------------------------------------------------------
+
+[outputs]
+root        = "outputs"
+logs        = "outputs/logs"
+figures     = "outputs/figures"
+metrics     = "outputs/metrics"
+checkpoints = "outputs/checkpoints"
+tensorboard = "outputs/tensorboard"
+
+# ---------------------------------------------------------------------------
+# Evaluation
+# ---------------------------------------------------------------------------
+
+[evaluation]
+# Number of samples used in the evaluation script.
+num_eval_samples = 64
+
+# Detector: path to SRNet weights and FSL centroids.
+# Leave empty ("") to use the fallback statistical detector.
+srnet_weights_path = ""
+centroid_path      = ""
+
+# Metrics reported in the evaluation summary.
+metrics = [
+    "accuracy_drop",
+    "payload_recovery",
+    "bit_error_rate",
+    "model_xray_detection_rate",
+    "embedding_capacity",
+]
+
+# ---------------------------------------------------------------------------
+# Standalone SRNet / FSL detector  (used by scripts/run_demo.py and
+# evaluation/fsl_detector.py)
+# ---------------------------------------------------------------------------
+
+[srnet_detector]
+# Input GF image side length (pixels).  SRNet expects 256×256.
+imsize = 256
+
+# Dimensionality of the L2-normalised SRNet output embedding.
+embedding_dim = 512
+
+# Margin α for the triplet loss: L = max(d(A,P) - d(A,N) + α, 0).
+triplet_margin = 0.5
+
+# Adam learning rate for SRNet FSL fine-tuning.
+fsl_lr = 6e-5
+
+# Number of triplet-loss training epochs.
+fsl_epochs = 50
+
+# Triplet batch size.
+fsl_batch_size = 32
+
+# Classifier after embedding: "centroid" (Nearest Centroid) or "1nn" (1-NN).
+classifier = "centroid"
+
+# Number of benign model checkpoints to generate for FSL training.
+num_benign_samples = 5
+
+# Number of malicious (payload-embedded) model checkpoints to generate.
+num_malicious_samples = 5

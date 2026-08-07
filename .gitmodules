@@ -1,0 +1,3 @@
+[submodule "external/ModelXRay"]
+	path = external/ModelXRay
+	url = https://github.com/danigil/ModelXRay.git
