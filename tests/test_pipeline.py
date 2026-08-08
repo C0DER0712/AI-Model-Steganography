@@ -103,18 +103,24 @@ class TestForwardPass:
         result = pipeline(images, labels, payload)
         assert result.classification_logits.shape == (2, 10)
 
-    def test_payload_logits_shape(self, pipeline: EmbeddingPipeline) -> None:
+    def test_payload_logits_shape(self, small_pipeline_config: PipelineConfig) -> None:
+        # payload_replicas must match the number of distinct payloads being
+        # embedded per step (it is independent of the image batch size).
+        cfg = PipelineConfig(**{**small_pipeline_config.__dict__, "payload_replicas": 2})
+        pipe = EmbeddingPipeline(cfg)
         images = torch.randn(2, 3, 8, 8)
         labels = torch.zeros(2, dtype=torch.long)
         payload = torch.randint(0, 2, (2, PAYLOAD_BITS), dtype=torch.float32)
-        result = pipeline(images, labels, payload)
+        result = pipe(images, labels, payload)
         assert result.payload_logits.shape == (2, PAYLOAD_BITS)
 
-    def test_detector_logits_shape(self, pipeline: EmbeddingPipeline) -> None:
+    def test_detector_logits_shape(self, small_pipeline_config: PipelineConfig) -> None:
+        cfg = PipelineConfig(**{**small_pipeline_config.__dict__, "payload_replicas": 2})
+        pipe = EmbeddingPipeline(cfg)
         images = torch.randn(2, 3, 8, 8)
         labels = torch.zeros(2, dtype=torch.long)
         payload = torch.randint(0, 2, (2, PAYLOAD_BITS), dtype=torch.float32)
-        result = pipeline(images, labels, payload)
+        result = pipe(images, labels, payload)
         assert result.detector_logits.shape == (2,)
 
     def test_detector_targets_are_benign(self, pipeline: EmbeddingPipeline) -> None:
@@ -125,6 +131,24 @@ class TestForwardPass:
         result = pipeline(images, labels, payload)
         assert torch.all(result.detector_targets == 0)
 
+    def test_payload_replicas_decoupled_from_image_batch(self, small_pipeline_config: PipelineConfig) -> None:
+        """Default payload_replicas=1 must NOT scale the expensive encoder
+        pass with image batch size — this is the fix for OOM on large host
+        models, where only one modified-weight replica is ever used for
+        classification regardless of how many images are classified."""
+        cfg = PipelineConfig(**{**small_pipeline_config.__dict__, "payload_replicas": 1})
+        pipe = EmbeddingPipeline(cfg)
+        images = torch.randn(16, 3, 8, 8)
+        labels = torch.zeros(16, dtype=torch.long)
+        payload = torch.randint(0, 2, (16, PAYLOAD_BITS), dtype=torch.float32)
+        result = pipe(images, labels, payload)
+        # Classification still sees the full image batch...
+        assert result.classification_logits.shape == (16, 10)
+        # ...but the expensive encoder/decoder/detector pass only ran once.
+        assert result.payload_logits.shape == (1, PAYLOAD_BITS)
+        assert result.detector_logits.shape == (1,)
+        assert result.modified_weights.shape[0] == 1
+
     def test_weight_representations_populated(self, pipeline: EmbeddingPipeline) -> None:
         images = torch.randn(1, 3, 8, 8)
         labels = torch.zeros(1, dtype=torch.long)
@@ -134,12 +158,14 @@ class TestForwardPass:
         assert result.original_weights is not None
         assert result.modified_weights.shape == result.original_weights.shape
 
-    def test_shared_payload_broadcast(self, pipeline: EmbeddingPipeline) -> None:
-        """A 1D payload should be broadcast across the batch dimension."""
+    def test_shared_payload_broadcast(self, small_pipeline_config: PipelineConfig) -> None:
+        """A 1D payload should be broadcast to `payload_replicas` samples."""
+        cfg = PipelineConfig(**{**small_pipeline_config.__dict__, "payload_replicas": 3})
+        pipe = EmbeddingPipeline(cfg)
         images = torch.randn(3, 3, 8, 8)
         labels = torch.zeros(3, dtype=torch.long)
         payload = torch.randint(0, 2, (PAYLOAD_BITS,), dtype=torch.float32)
-        result = pipeline(images, labels, payload)
+        result = pipe(images, labels, payload)
         assert result.payload_logits.shape[0] == 3
 
 
