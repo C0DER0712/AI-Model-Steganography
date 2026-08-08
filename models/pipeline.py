@@ -137,6 +137,28 @@ class EmbeddingPipeline(nn.Module):
         # The detector is always frozen; enforce it here.
         self.detector.freeze()
 
+        # When the host model is frozen (the default), its weights never
+        # change across the whole training run, so extracting them and
+        # converting to the 4-channel representation is identical work
+        # every single step. That conversion round-trips through CPU (numpy
+        # bit manipulation), which stalls the GPU waiting on synchronous
+        # CUDA->CPU->CUDA transfers every step — this is the dominant cost
+        # for large host models, not the GPU compute itself. Do it once here
+        # instead of inside forward().
+        self._cached_weight_records: list[WeightTensor] | None = None
+        self._cached_original_repr: torch.Tensor | None = None
+        if not cfg.train_host_model:
+            with torch.no_grad():
+                weight_records = extract_weights(self.host_model.model)
+                flat_weights = flatten_weights(weight_records)
+                channels_uint8 = weights_to_channels(flat_weights)
+                cached_repr = torch.from_numpy(channels_uint8.astype(np.float32))
+            self._cached_weight_records = weight_records
+            # register_buffer so `.to(device)` / `.cuda()` on the pipeline
+            # moves this cached image along with the rest of the module,
+            # without it being treated as a learnable parameter.
+            self.register_buffer("_cached_original_repr_buf", cached_repr, persistent=False)
+
     def forward(
         self,
         images: torch.Tensor,
@@ -170,13 +192,22 @@ class EmbeddingPipeline(nn.Module):
         payload_bits = payload_bits.to(device=device, dtype=torch.float32)
 
         # ---- Extract flat weights from host model ----
-        weight_records = extract_weights(self.host_model.model)
-        flat_weights = flatten_weights(weight_records).to(device)  # (N,)
+        # Skip recomputation entirely when the host model is frozen (the
+        # default) — see the caching note in __init__. Only when
+        # train_host_model=True do the weight VALUES actually change
+        # between steps, so only then do we re-extract every call.
+        if self._cached_weight_records is not None:
+            weight_records = self._cached_weight_records
+            original_repr = self._cached_original_repr_buf.to(device)
+        else:
+            weight_records = extract_weights(self.host_model.model)
+            flat_weights = flatten_weights(weight_records).to(device)  # (N,)
+            channels_uint8 = weights_to_channels(flat_weights)  # numpy (4, H, W) uint8
+            original_repr = torch.from_numpy(channels_uint8.astype(np.float32)).to(device)
+        # Total real (unpadded) element count — needed downstream to trim
+        # padding when reconstructing weights from the channel image.
+        num_weight_values = sum(record.values.numel() for record in weight_records)
 
-        # ---- Convert to 4-channel representation (float) ----
-        channels_uint8 = weights_to_channels(flat_weights)  # numpy (4, H, W) uint8
-        # Keep as float32 so the encoder can process it with gradients.
-        original_repr = torch.from_numpy(channels_uint8.astype(np.float32)).to(device)
         # Only replicate the (expensive) weight image `num_replicas` times,
         # NOT once per image in the classification batch.
         original_repr_batch = original_repr.unsqueeze(0).expand(num_replicas, -1, -1, -1)
@@ -205,7 +236,7 @@ class EmbeddingPipeline(nn.Module):
         # Use the first sample's modified representation for weight reconstruction.
         modified_repr_single = modified_repr_batch[0]  # (4, H, W)
         modified_flat = _ChannelsToWeightsSTE.apply(
-            modified_repr_single, len(weight_records), flat_weights.numel()
+            modified_repr_single, len(weight_records), num_weight_values
         )
         # Rebuild parameter dict for functional_call.
         modified_params = _rebuild_params(
