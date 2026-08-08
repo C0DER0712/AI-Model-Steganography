@@ -10,6 +10,7 @@ import torch
 from torch import nn
 from torch.utils.tensorboard import SummaryWriter
 
+from models.decoder import payload_reconstruction_accuracy
 from training.losses import LossInputs, LossOutput
 
 
@@ -138,6 +139,7 @@ class Trainer:
 
             self._update_checkpointing(epoch, metrics)
             self._log_epoch(epoch, metrics)
+            self._print_epoch_summary(epoch, metrics)
 
             if self.state.stopped_early:
                 break
@@ -164,10 +166,17 @@ class Trainer:
         count = 0
 
         for batch in self.val_loader:
-            loss_output = self._compute_loss(batch)
+            loss_inputs = self.batch_to_loss_inputs(self.model, batch, self.device)
+            loss_output = self._compute_loss_from_inputs(loss_inputs)
             self._accumulate(totals, "val_loss", loss_output.total.detach())
             for name, value in loss_output.components.items():
                 self._accumulate(totals, f"val_{name}", value)
+            if loss_inputs.payload_logits is not None and loss_inputs.payload_targets is not None:
+                predicted_bits = (torch.sigmoid(loss_inputs.payload_logits) > 0.5).float()
+                accuracy = payload_reconstruction_accuracy(
+                    predicted_bits, loss_inputs.payload_targets
+                )
+                self._accumulate(totals, "val_payload_accuracy", torch.tensor(accuracy))
             count += 1
 
         metrics = {key: value / count for key, value in totals.items()} if count else {}
@@ -269,6 +278,9 @@ class Trainer:
 
     def _compute_loss(self, batch: Any) -> LossOutput:
         loss_inputs = self.batch_to_loss_inputs(self.model, batch, self.device)
+        return self._compute_loss_from_inputs(loss_inputs)
+
+    def _compute_loss_from_inputs(self, loss_inputs: LossInputs) -> LossOutput:
         output = self.loss_fn(loss_inputs)
         if isinstance(output, LossOutput):
             return output
@@ -338,6 +350,28 @@ class Trainer:
     def _log_epoch(self, epoch: int, metrics: Mapping[str, float]) -> None:
         for key, value in metrics.items():
             self.writer.add_scalar(key, value, epoch)
+
+    @staticmethod
+    def _print_epoch_summary(epoch: int, metrics: Mapping[str, float]) -> None:
+        """Print a concise, one-line-per-epoch summary to console.
+
+        Only fires once per epoch (not per step) so it's usable on
+        platforms like Kaggle where per-step output is easy to lose track
+        of in a long-running cell.
+        """
+
+        train_loss = metrics.get("train_loss")
+        val_loss = metrics.get("val_loss")
+        val_payload_accuracy = metrics.get("val_payload_accuracy")
+
+        parts = [f"epoch {epoch + 1}"]
+        if train_loss is not None:
+            parts.append(f"train_loss={train_loss:.4f}")
+        if val_loss is not None:
+            parts.append(f"val_loss={val_loss:.4f}")
+        if val_payload_accuracy is not None:
+            parts.append(f"val_payload_recovery_accuracy={val_payload_accuracy * 100:.2f}%")
+        print(" | ".join(parts), flush=True)
 
     @staticmethod
     def _accumulate(totals: dict[str, float], key: str, value: torch.Tensor) -> None:

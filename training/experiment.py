@@ -416,9 +416,20 @@ def _scheduler_interval(scheduler: str) -> str:
 
 
 def _extract_final_ber(history: list[dict[str, float]]) -> float | None:
-    """Extract the most recent bit-error-rate from training history."""
+    """Extract the most recent bit-error-rate from training history.
+
+    Prior to this fix, nothing in the training loop ever logged a
+    ``val_ber``/``train_ber``/``bit_error_rate`` key, so this always
+    returned ``None`` and capacity reports always showed "N/A" regardless
+    of how training actually went. `Trainer` now logs
+    ``val_payload_accuracy`` each epoch (see `training/trainer.py`), so
+    derive BER from that as `1 - accuracy` when the direct keys aren't
+    present.
+    """
     for entry in reversed(history):
         for key in ("val_ber", "train_ber", "bit_error_rate"):
             if key in entry:
                 return float(entry[key])
+        if "val_payload_accuracy" in entry:
+            return 1.0 - float(entry["val_payload_accuracy"])
     return None
