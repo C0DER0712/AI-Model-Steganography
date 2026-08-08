@@ -21,10 +21,10 @@ class LossWeights:
         detector: Delta coefficient for frozen-detector loss.
     """
 
-    classification: float = 1.0
-    payload: float = 1.0
-    distortion: float = 1.0
-    detector: float = 1.0
+    classification: float = 0.5
+    payload: float = 10.0
+    distortion: float = 200.0
+    detector: float = 2.0
 
 
 @dataclass(frozen=True)
