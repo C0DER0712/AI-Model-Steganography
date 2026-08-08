@@ -56,6 +56,19 @@ class PipelineConfig:
         decoder: Decoder architecture config.
         detector: Frozen detector architecture config.
         payload_bits: Number of payload bits per training sample.
+        payload_replicas: Number of full-resolution encoder/decoder/detector
+            forward passes run per training step, independent of the image
+            batch size. Only the FIRST replica's modified weights are ever
+            used for the classification loss (see `forward`), so replicating
+            the encoder pass once per *image* in the batch is pure waste —
+            it multiplies the (already huge, whole-weight-image) CNN
+            activation memory by the image batch size for no benefit.
+            `payload_replicas` instead controls how many independent
+            payloads are embedded and decoded per step, which is what
+            actually needs batching for payload-recovery training signal.
+            Keep this small (1-2) for large host models on limited-VRAM
+            GPUs; the image batch size (set by the data loader) can stay
+            larger since classification reuses a single modified weight set.
     """
 
     host_model_name: HostModelName = "resnet18"
@@ -66,6 +79,7 @@ class PipelineConfig:
     decoder: DecoderConfig = None          # type: ignore[assignment]
     detector: DifferentiableDetectorConfig = None  # type: ignore[assignment]
     payload_bits: int = 8192  # 1024 bytes
+    payload_replicas: int = 1
 
     def __post_init__(self) -> None:
         # Allow None sentinels; replace with defaults sized to self.payload_bits.
@@ -141,10 +155,18 @@ class EmbeddingPipeline(nn.Module):
             :class:`~training.losses.LossInputs` with all tensors populated.
         """
         device = images.device
+        image_batch_size = images.shape[0]
 
-        # ---- Broadcast shared payload across the batch ----
+        # ---- How many full-resolution encoder passes this step runs ----
+        # Capped by both the configured `payload_replicas` and the number of
+        # images available (never replicate beyond what the batch provides).
+        num_replicas = max(1, min(self.config.payload_replicas, image_batch_size))
+
+        # ---- Broadcast/select payload for exactly `num_replicas` samples ----
         if payload_bits.ndim == 1:
-            payload_bits = payload_bits.unsqueeze(0).expand(images.shape[0], -1)
+            payload_bits = payload_bits.unsqueeze(0).expand(num_replicas, -1)
+        else:
+            payload_bits = payload_bits[:num_replicas]
         payload_bits = payload_bits.to(device=device, dtype=torch.float32)
 
         # ---- Extract flat weights from host model ----
@@ -155,24 +177,27 @@ class EmbeddingPipeline(nn.Module):
         channels_uint8 = weights_to_channels(flat_weights)  # numpy (4, H, W) uint8
         # Keep as float32 so the encoder can process it with gradients.
         original_repr = torch.from_numpy(channels_uint8.astype(np.float32)).to(device)
-        # Add batch dimension for the encoder.
-        original_repr_batch = original_repr.unsqueeze(0).expand(images.shape[0], -1, -1, -1)
+        # Only replicate the (expensive) weight image `num_replicas` times,
+        # NOT once per image in the classification batch.
+        original_repr_batch = original_repr.unsqueeze(0).expand(num_replicas, -1, -1, -1)
 
         # ---- Encoder: produce modified representation ----
+        # This CNN forward pass runs over the FULL weight image, so its cost
+        # scales with num_replicas, not with the (potentially much larger)
+        # image_batch_size used for classification below.
         modified_repr_batch = self.encoder(original_repr_batch, payload_bits)
-        # Shape: (B, 4, H, W)
+        # Shape: (num_replicas, 4, H, W)
 
-        # ---- Decoder: recover payload from first item in batch ----
-        # We use the per-sample modified representation for per-sample payload decoding.
+        # ---- Decoder: recover payload from each replica ----
         payload_logits = self.decoder(modified_repr_batch, self.config.payload_bits)
-        # Shape: (B, num_chunks, chunk_size) → flatten for loss
-        payload_logits_flat = payload_logits.reshape(images.shape[0], -1)[
+        # Shape: (num_replicas, num_chunks, chunk_size) → flatten for loss
+        payload_logits_flat = payload_logits.reshape(num_replicas, -1)[
             :, : self.config.payload_bits
         ]
 
         # ---- Detector: score the modified representation ----
         # The detector is frozen but its forward pass is differentiable w.r.t. input.
-        detector_logits = self.detector(modified_repr_batch).squeeze(-1)  # (B,)
+        detector_logits = self.detector(modified_repr_batch).squeeze(-1)  # (num_replicas,)
         # Target: predict as benign (label = 0) to fool the detector.
         detector_targets = torch.zeros_like(detector_logits)
 
@@ -193,7 +218,7 @@ class EmbeddingPipeline(nn.Module):
             classification_logits=classification_logits,
             classification_targets=labels,
             payload_logits=payload_logits_flat,
-            payload_targets=payload_bits.reshape(images.shape[0], -1)[
+            payload_targets=payload_bits.reshape(num_replicas, -1)[
                 :, : self.config.payload_bits
             ],
             modified_weights=modified_repr_batch,

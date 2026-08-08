@@ -35,6 +35,15 @@ class EncoderConfig:
         attention_reduction: Reduction ratio in channel-attention MLPs.
         dropout: Dropout probability applied to payload embeddings.
         max_delta: Scale applied to the predicted residual update.
+        gradient_checkpointing: If true, wraps each residual block in
+            `torch.utils.checkpoint.checkpoint`, trading extra compute
+            (recomputing activations during backward) for a large cut in
+            peak activation memory. Since every layer here operates on the
+            full weight-image resolution, activation memory dominates GPU
+            usage — this is the single most effective memory lever short of
+            shrinking the model itself, and preserves capacity/quality
+            unlike reducing `base_channels`. Recommended on GPUs under
+            ~8-12GB VRAM.
     """
 
     input_channels: int = 4
@@ -47,6 +56,7 @@ class EncoderConfig:
     attention_reduction: int = 8
     dropout: float = 0.0
     max_delta: float = 1.0
+    gradient_checkpointing: bool = False
 
 
 class ConvNormActivation(nn.Module):
@@ -272,8 +282,14 @@ class WeightPayloadEncoder(nn.Module):
         features = self.stem(weight_representation.to(dtype=torch.float32))
         payload_embedding = self.payload_encoder(payload)
 
+        use_checkpoint = self.config.gradient_checkpointing and self.training
         for block in self.blocks:
-            features = block(features, payload_embedding)
+            if use_checkpoint:
+                features = torch.utils.checkpoint.checkpoint(
+                    block, features, payload_embedding, use_reentrant=False
+                )
+            else:
+                features = block(features, payload_embedding)
 
         delta = torch.tanh(self.output_projection(features)) * self.config.max_delta
         output = weight_representation.to(dtype=torch.float32) + delta

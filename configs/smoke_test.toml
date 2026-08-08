@@ -1,0 +1,18 @@
+﻿[host_model]
+name = "tiny_bn"
+num_classes = 10
+pretrained = false
+train_host_model = false
+
+[data]
+payload_size = "128KB"
+synthetic_samples = 32
+val_split = 0.25
+num_workers = 0
+
+[training]
+max_epochs = 2
+batch_size = 4
+payload_replicas = 1
+learning_rate = 1.0e-4
+mixed_precision = false

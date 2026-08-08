@@ -157,6 +157,17 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
                         help="Maximum training epochs. (default: 10)")
     parser.add_argument("--batch-size", type=int, default=None,
                         help="Batch size. (default: 4)")
+    parser.add_argument(
+        "--payload-replicas", type=int, default=None,
+        help=(
+            "Number of full-resolution encoder/decoder/detector forward "
+            "passes per step, independent of --batch-size (which only "
+            "affects the classification loss). Keep this small (1-2) on "
+            "limited-VRAM GPUs — the encoder runs its CNN over the ENTIRE "
+            "weight image once per replica, so memory scales with this "
+            "value, not with --batch-size. (default: 1)"
+        ),
+    )
     parser.add_argument("--lr", type=float, default=None,
                         help="Initial learning rate. (default: 1e-4)")
     parser.add_argument("--weight-decay", type=float, default=None,
@@ -276,6 +287,7 @@ def main(argv: list[str] | None = None) -> int:
         attention_reduction=enc_sec.get("attention_reduction", 8),
         dropout=enc_sec.get("dropout", 0.0),
         max_delta=enc_sec.get("max_delta", 1.0),
+        gradient_checkpointing=enc_sec.get("gradient_checkpointing", False),
     )
     decoder_cfg = DecoderConfig(
         chunk_size=dec_sec.get("chunk_size", 1024),
@@ -285,6 +297,7 @@ def main(argv: list[str] | None = None) -> int:
         chunk_position_dim=dec_sec.get("chunk_position_dim", 64),
         hidden_dim=dec_sec.get("hidden_dim", 256),
         dropout=dec_sec.get("dropout", 0.0),
+        gradient_checkpointing=dec_sec.get("gradient_checkpointing", False),
     )
 
     # ---- Build pipeline config ----
@@ -294,6 +307,7 @@ def main(argv: list[str] | None = None) -> int:
         host_model_pretrained=_resolve(args.pretrained, host_sec.get("pretrained"), False),
         train_host_model=_resolve(args.train_host_model, host_sec.get("train_host_model"), False),
         payload_bits=payload_bits,
+        payload_replicas=_resolve(args.payload_replicas, train_sec.get("payload_replicas"), 1),
         encoder=encoder_cfg,
         decoder=decoder_cfg,
     )

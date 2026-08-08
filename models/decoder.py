@@ -29,6 +29,10 @@ class DecoderConfig:
         chunk_position_dim: Size of sinusoidal chunk-position features.
         hidden_dim: Hidden width of the shared chunk reconstruction head.
         dropout: Dropout probability in the chunk reconstruction head.
+        gradient_checkpointing: If true, wraps each residual block in
+            `torch.utils.checkpoint.checkpoint` to cut peak activation
+            memory at the cost of extra compute during backward. See
+            `EncoderConfig.gradient_checkpointing` for rationale.
     """
 
     input_channels: int = 4
@@ -39,6 +43,7 @@ class DecoderConfig:
     chunk_position_dim: int = 64
     hidden_dim: int = 256
     dropout: float = 0.0
+    gradient_checkpointing: bool = False
 
 
 class ConvNormActivation(nn.Module):
@@ -206,8 +211,14 @@ class ChunkedPayloadDecoder(nn.Module):
         num_chunks = math.ceil(num_bits / self.config.chunk_size)
 
         features = self.stem(weight_representation.to(dtype=torch.float32))
+        use_checkpoint = self.config.gradient_checkpointing and self.training
         for block in self.blocks:
-            features = block(features)
+            if use_checkpoint:
+                features = torch.utils.checkpoint.checkpoint(
+                    block, features, use_reentrant=False
+                )
+            else:
+                features = block(features)
 
         global_features = self.global_pool(features).flatten(start_dim=1)
         positions = sinusoidal_chunk_positions(
