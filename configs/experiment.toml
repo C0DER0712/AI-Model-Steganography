@@ -118,9 +118,9 @@ max_delta            = 4.0
 # to the full payload length; that collapses chunking into one dense
 # hidden_dim x payload_bits layer (hundreds of millions of params for large
 # payloads). MUST match [encoder] payload_chunk_size above.
-chunk_size         = 4096
+chunk_size         = 32
 input_channels     = 4
-base_channels      = 32
+base_channels      = 16
 num_residual_blocks = 3
 attention_reduction = 8
 chunk_position_dim = 64
