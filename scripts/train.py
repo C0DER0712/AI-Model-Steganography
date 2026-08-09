@@ -284,6 +284,7 @@ def main(argv: list[str] | None = None) -> int:
         num_residual_blocks=enc_sec.get("num_residual_blocks", 4),
         payload_embedding_dim=enc_sec.get("payload_embedding_dim", 256),
         payload_chunk_size=enc_sec.get("payload_chunk_size", 1024),
+        chunk_position_dim=enc_sec.get("chunk_position_dim", 64),
         attention_reduction=enc_sec.get("attention_reduction", 8),
         dropout=enc_sec.get("dropout", 0.0),
         max_delta=enc_sec.get("max_delta", 1.0),

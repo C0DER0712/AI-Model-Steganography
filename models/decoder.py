@@ -12,6 +12,7 @@ from dataclasses import dataclass
 
 import torch
 from torch import nn
+from torch.nn import functional as F
 
 from utils.payload import tensor_to_payload
 
@@ -122,7 +123,15 @@ class ResidualDecoderBlock(nn.Module):
 
 
 class ChunkHead(nn.Module):
-    """Shared MLP head that predicts one payload chunk at a time."""
+    """Shared MLP head that predicts one payload chunk at a time.
+
+    Takes per-chunk REGIONAL features (distinct per chunk), not a single
+    global feature vector broadcast identically to every chunk. Sharing one
+    global vector across all chunks gives the network no way to recover
+    payload bits it hasn't specifically memorized, since every chunk's
+    prediction would be conditioned on exactly the same evidence — see
+    `ChunkedPayloadDecoder` for how region-specific features are produced.
+    """
 
     def __init__(
         self,
@@ -134,7 +143,7 @@ class ChunkHead(nn.Module):
     ) -> None:
         super().__init__()
 
-        # Linear layer fuses global image features with one chunk position.
+        # Linear layer fuses this chunk's regional features with its position.
         self.input_projection = nn.Linear(feature_dim + position_dim, hidden_dim)
         # GELU gives the shared head nonlinear reconstruction capacity.
         self.activation = nn.GELU()
@@ -145,16 +154,20 @@ class ChunkHead(nn.Module):
 
     def forward(
         self,
-        global_features: torch.Tensor,
+        region_features: torch.Tensor,
         chunk_positions: torch.Tensor,
     ) -> torch.Tensor:
-        """Predict chunk logits for every requested chunk position."""
+        """Predict chunk logits for every requested chunk position.
 
-        batch_size = global_features.shape[0]
-        num_chunks = chunk_positions.shape[0]
-        features = global_features.unsqueeze(1).expand(batch_size, num_chunks, -1)
+        Args:
+            region_features: Shape `(batch, num_chunks, feature_dim)` —
+                spatially-distinct features per chunk.
+            chunk_positions: Shape `(num_chunks, position_dim)`.
+        """
+
+        batch_size, num_chunks, _ = region_features.shape
         positions = chunk_positions.unsqueeze(0).expand(batch_size, num_chunks, -1)
-        hidden = torch.cat([features, positions], dim=-1)
+        hidden = torch.cat([region_features, positions], dim=-1)
         hidden = self.input_projection(hidden)
         hidden = self.activation(hidden)
         hidden = self.dropout(hidden)
@@ -181,8 +194,6 @@ class ChunkedPayloadDecoder(nn.Module):
                 for _ in range(config.num_residual_blocks)
             ]
         )
-        # AdaptiveAvgPool2d converts arbitrary spatial sizes to one feature vector.
-        self.global_pool = nn.AdaptiveAvgPool2d(1)
         # ChunkHead is shared across all chunks, keeping parameter count scalable.
         self.chunk_head = ChunkHead(
             feature_dim=config.base_channels,
@@ -220,13 +231,23 @@ class ChunkedPayloadDecoder(nn.Module):
             else:
                 features = block(features)
 
-        global_features = self.global_pool(features).flatten(start_dim=1)
+        # Pool into a grid_side x grid_side grid of REGIONS (instead of one
+        # global vector) so each chunk gets spatially-distinct evidence.
+        # grid_side matches the encoder's spatial FiLM conditioning grid
+        # (see WeightPayloadEncoder), so region i here corresponds to the
+        # same image region chunk i's payload bits were embedded into.
+        grid_side = math.ceil(math.sqrt(num_chunks))
+        region_grid = F.adaptive_avg_pool2d(features, output_size=(grid_side, grid_side))
+        # (batch, channels, grid_side, grid_side) -> (batch, grid_side*grid_side, channels)
+        region_features = region_grid.flatten(start_dim=2).transpose(1, 2)
+        region_features = region_features[:, :num_chunks, :]
+
         positions = sinusoidal_chunk_positions(
             num_chunks=num_chunks,
             dim=self.config.chunk_position_dim,
             device=weight_representation.device,
         )
-        return self.chunk_head(global_features, positions)
+        return self.chunk_head(region_features, positions)
 
     @torch.no_grad()
     def decode(

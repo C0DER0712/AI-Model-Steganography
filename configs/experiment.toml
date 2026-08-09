@@ -90,9 +90,18 @@ payload_embedding_dim = 256
 # Independent of payload_dim by design — this is what keeps parameter count
 # small regardless of payload size (see models/encoder.py::PayloadEncoder).
 payload_chunk_size   = 1024
+# Dimensionality of the sinusoidal chunk-position encoding used to place
+# each payload chunk into the encoder's spatial conditioning grid. MUST
+# match [decoder] chunk_position_dim below — both use the identical
+# sinusoidal formula, and using different dims would break the encoder/
+# decoder chunk-to-region alignment.
+chunk_position_dim  = 64
 attention_reduction  = 8
 dropout              = 0.0
-max_delta            = 1.0
+# Bound on the encoder's per-pixel residual (0-255 scale). Kept modest for
+# stealth, but too small starves the payload signal — see the encoder/
+# decoder spatial-conditioning fix in models/encoder.py and models/decoder.py.
+max_delta            = 4.0
 
 # ---------------------------------------------------------------------------
 # Decoder architecture
