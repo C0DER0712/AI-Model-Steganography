@@ -78,7 +78,12 @@ output_channels      = 4
 # base_channels multiplies memory directly since every conv layer operates
 # on the FULL weight-image resolution — if you go back to a small local GPU,
 # drop this back down (see gradient_checkpointing note below).
-base_channels        = 32
+# On Kaggle's T4/P100, raised from 32 -> 64: gives the per-chunk information
+# bottleneck (base_channels feature dims per chunk, see payload_chunk_size
+# below) more room, which turned out to be the actual limiting factor for
+# payload recovery — see models/encoder.py::PayloadEncoder and
+# models/decoder.py::ChunkHead docstrings.
+base_channels        = 64
 num_residual_blocks  = 3
 # Cuts peak activation memory substantially at the cost of extra compute
 # during backward (recomputes forward activations). Turn this on first if
@@ -93,7 +98,15 @@ payload_embedding_dim = 256
 # 128KB payload) means less spatial-routing complexity for the encoder to
 # learn — each chunk needs its own region of the grid to be reliably
 # recoverable, and 1024 simultaneous regions was very slow to converge.
-payload_chunk_size   = 4096
+# CRITICAL: keep chunk_size/base_channels roughly 2-4. This ratio (bits
+# each chunk's pooled feature vector must carry) turned out to matter far
+# more than chunk COUNT for whether payload recovery can learn at all:
+# chunk_size=4096 with base_channels=32 (ratio 128) trained to a complete
+# flat line with zero learning; chunk_size=64 with base_channels=32 (ratio
+# 2) learned cleanly. At base_channels=64 here, chunk_size=256 keeps the
+# same safe ratio (4) while using fewer, more practical chunk counts than
+# ratio=2 would (256 vs 64 -> ~4096 vs ~16384 chunks for a 128KB payload).
+payload_chunk_size   = 256
 # Dimensionality of the sinusoidal chunk-position encoding used to place
 # each payload chunk into the encoder's spatial conditioning grid. MUST
 # match [decoder] chunk_position_dim below — both use the identical
@@ -114,13 +127,13 @@ max_delta            = 4.0
 [decoder]
 # Number of payload bits reconstructed per shared ChunkHead call. Independent
 # of payload size by design — ChunkedPayloadDecoder applies this SAME small
-# head across ceil(payload_bits / chunk_size) chunks. Do not set this equal
-# to the full payload length; that collapses chunking into one dense
-# hidden_dim x payload_bits layer (hundreds of millions of params for large
-# payloads). MUST match [encoder] payload_chunk_size above.
-chunk_size         = 32
+# # MUST match [encoder] payload_chunk_size above, and keep chunk_size /
+# base_channels roughly 2-4 -- see the note on [encoder] payload_chunk_size
+# for why this ratio, not chunk count, is what determines whether payload
+# recovery can learn at all.
+chunk_size         = 256
 input_channels     = 4
-base_channels      = 16
+base_channels      = 64
 num_residual_blocks = 3
 attention_reduction = 8
 chunk_position_dim = 64
