@@ -74,12 +74,12 @@ train_host_model = false
 # payload_dim = <auto>  →  SUPPORTED_PAYLOAD_SIZES[payload_size] * 8
 input_channels       = 4
 output_channels      = 4
-# Reduced from 64 -> 16. base_channels multiplies memory directly since
-# every conv layer operates on the FULL weight-image resolution; on a
-# consumer GPU (e.g. RTX 3050) 64 will OOM even at batch_size=1 for any
-# real host model. Raise this once you've confirmed a config fits in VRAM.
-base_channels        = 16
-num_residual_blocks  = 2
+# On Kaggle's T4/P100 (much more VRAM than an RTX 3050), raised from 16 -> 32.
+# base_channels multiplies memory directly since every conv layer operates
+# on the FULL weight-image resolution — if you go back to a small local GPU,
+# drop this back down (see gradient_checkpointing note below).
+base_channels        = 32
+num_residual_blocks  = 3
 # Cuts peak activation memory substantially at the cost of extra compute
 # during backward (recomputes forward activations). Turn this on first if
 # you hit CUDA OOM, before shrinking base_channels/num_residual_blocks
@@ -89,7 +89,11 @@ payload_embedding_dim = 256
 # Width of the shared linear layer used to embed each payload chunk.
 # Independent of payload_dim by design — this is what keeps parameter count
 # small regardless of payload size (see models/encoder.py::PayloadEncoder).
-payload_chunk_size   = 1024
+# Raised from 1024 -> 4096: fewer, larger chunks (256 instead of 1024 for a
+# 128KB payload) means less spatial-routing complexity for the encoder to
+# learn — each chunk needs its own region of the grid to be reliably
+# recoverable, and 1024 simultaneous regions was very slow to converge.
+payload_chunk_size   = 4096
 # Dimensionality of the sinusoidal chunk-position encoding used to place
 # each payload chunk into the encoder's spatial conditioning grid. MUST
 # match [decoder] chunk_position_dim below — both use the identical
@@ -113,11 +117,11 @@ max_delta            = 4.0
 # head across ceil(payload_bits / chunk_size) chunks. Do not set this equal
 # to the full payload length; that collapses chunking into one dense
 # hidden_dim x payload_bits layer (hundreds of millions of params for large
-# payloads).
-chunk_size         = 1024
+# payloads). MUST match [encoder] payload_chunk_size above.
+chunk_size         = 4096
 input_channels     = 4
-base_channels      = 16
-num_residual_blocks = 2
+base_channels      = 32
+num_residual_blocks = 3
 attention_reduction = 8
 chunk_position_dim = 64
 hidden_dim         = 256
@@ -155,9 +159,16 @@ delta = 1.0   # Frozen detector evasion
 # ---------------------------------------------------------------------------
 
 [training]
-max_epochs            = 50
+max_epochs            = 300
 batch_size            = 16
-learning_rate         = 1.0e-4
+# Raised from 1e-4 -> 2e-3. At the old rate, real (fixed-architecture)
+# learning was measurably happening but far too slowly to be practical —
+# ~1.36 percentage points of movement over 50 epochs. Since you're
+# currently running a payload-only warm-up (other loss weights at 0),
+# there's no competing objective to destabilize, so it's safe to be
+# aggressive here. Pull this back down once you reintroduce
+# classification/distortion/detector losses.
+learning_rate         = 2.0e-3
 weight_decay          = 1.0e-5
 gradient_clip_norm    = 1.0
 # Enabled by default: roughly halves activation memory on CUDA, which

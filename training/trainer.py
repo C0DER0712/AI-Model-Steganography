@@ -363,14 +363,25 @@ class Trainer:
         train_loss = metrics.get("train_loss")
         val_loss = metrics.get("val_loss")
         val_payload_accuracy = metrics.get("val_payload_accuracy")
+        # Raw (unweighted) payload BCE loss is a far more sensitive signal
+        # than thresholded accuracy for large payloads: with e.g. ~53M total
+        # bit predictions in a 128KB-payload validation set, small real
+        # improvements can be invisible in accuracy at 2-decimal precision
+        # for many epochs, while the continuous BCE loss moves immediately.
+        val_payload_loss = metrics.get("val_payload")
+        train_payload_loss = metrics.get("train_payload")
 
         parts = [f"epoch {epoch + 1}"]
         if train_loss is not None:
             parts.append(f"train_loss={train_loss:.4f}")
         if val_loss is not None:
             parts.append(f"val_loss={val_loss:.4f}")
+        if train_payload_loss is not None:
+            parts.append(f"train_payload_bce={train_payload_loss:.6f}")
+        if val_payload_loss is not None:
+            parts.append(f"val_payload_bce={val_payload_loss:.6f}")
         if val_payload_accuracy is not None:
-            parts.append(f"val_payload_recovery_accuracy={val_payload_accuracy * 100:.2f}%")
+            parts.append(f"val_payload_recovery_accuracy={val_payload_accuracy * 100:.4f}%")
         print(" | ".join(parts), flush=True)
 
     @staticmethod
