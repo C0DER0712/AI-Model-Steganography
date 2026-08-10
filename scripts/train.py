@@ -320,6 +320,18 @@ def main(argv: list[str] | None = None) -> int:
         distortion=_resolve(args.gamma, loss_sec.get("gamma"), 1.0),
         detector=_resolve(args.delta, loss_sec.get("delta"), 1.0),
     )
+    # Explicit confirmation of the ACTUALLY-resolved weights (as opposed to
+    # what's on disk in the config file, which CLI flags override silently)
+    # — printed unconditionally, not gated by --verbose, since a mismatch
+    # here has caused real confusion before.
+    logger.info(
+        "Resolved loss weights: alpha(classification)=%s beta(payload)=%s "
+        "gamma(distortion)=%s delta(detector)=%s",
+        loss_weights.classification,
+        loss_weights.payload,
+        loss_weights.distortion,
+        loss_weights.detector,
+    )
 
     # ---- Build experiment config ----
     gradient_clip_raw = _resolve(args.gradient_clip, train_sec.get("gradient_clip_norm"), 1.0)
