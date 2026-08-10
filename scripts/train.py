@@ -439,16 +439,8 @@ def main(argv: list[str] | None = None) -> int:
     # ---- Run experiment ----
     experiment = SteganographyExperiment(exp_cfg)
 
-    if args.resume is not None:
-        logger.info("Checkpoint resumption requested from %s.", args.resume)
-        logger.warning(
-            "Automatic checkpoint resumption is not yet supported in the "
-            "experiment runner.  Start training from scratch or call "
-            "trainer.load_checkpoint() manually."
-        )
-
     logger.info("Starting experiment…")
-    result = experiment.run(train_loader, val_loader)
+    result = experiment.run(train_loader, val_loader, resume_from=args.resume)
 
     logger.info("Experiment finished in %.1f seconds.", result.elapsed_seconds)
     if result.capacity is not None:

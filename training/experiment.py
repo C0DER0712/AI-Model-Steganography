@@ -129,6 +129,7 @@ class SteganographyExperiment:
         self,
         train_loader: DataLoader[Any],
         val_loader: DataLoader[Any] | None = None,
+        resume_from: str | Path | None = None,
     ) -> ExperimentResult:
         """Build all components, train, evaluate, and save artefacts.
 
@@ -136,6 +137,12 @@ class SteganographyExperiment:
             train_loader: Training data loader yielding
                 ``(images, labels, payload_bits)`` tuples.
             val_loader: Optional validation data loader with the same schema.
+            resume_from: Optional path to a checkpoint (as saved by
+                `Trainer` to `checkpoints/latest.pt` or `best.pt`). When
+                given, model/optimizer/scheduler/scaler state and the
+                trainer's epoch counter are restored before training
+                resumes, continuing from the next epoch rather than
+                starting over.
 
         Returns:
             :class:`ExperimentResult` summarising the completed run.
@@ -198,6 +205,17 @@ class SteganographyExperiment:
             scheduler=scheduler,
             batch_to_loss_inputs=_pipeline_batch_adapter,
         )
+
+        # ---- Resume from checkpoint, if requested ----
+        if resume_from is not None:
+            logger.info("Resuming from checkpoint: %s", resume_from)
+            trainer.load_checkpoint(resume_from)
+            logger.info(
+                "Restored model/optimizer/scheduler/scaler state. "
+                "Resuming at epoch %d of %d.",
+                trainer.state.epoch + 1,
+                cfg.max_epochs,
+            )
 
         # ---- Train ----
         logger.info("Starting training for %d epochs…", cfg.max_epochs)
