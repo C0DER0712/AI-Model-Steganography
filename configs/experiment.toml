@@ -78,12 +78,11 @@ output_channels      = 4
 # base_channels multiplies memory directly since every conv layer operates
 # on the FULL weight-image resolution — if you go back to a small local GPU,
 # drop this back down (see gradient_checkpointing note below).
-# On Kaggle's T4/P100, raised from 32 -> 64: gives the per-chunk information
-# bottleneck (base_channels feature dims per chunk, see payload_chunk_size
-# below) more room, which turned out to be the actual limiting factor for
-# payload recovery — see models/encoder.py::PayloadEncoder and
-# models/decoder.py::ChunkHead docstrings.
-base_channels        = 64
+# On T4/P100 with the num_chunks that a small chunk_size produces (see
+# payload_chunk_size below), base_channels=64 + many chunks together OOM'd
+# a 15GB GPU even at batch_size=1. Reverted to 32 (proven to fit) rather
+# than raising both base_channels and chunk count simultaneously again.
+base_channels        = 32
 num_residual_blocks  = 3
 # Cuts peak activation memory substantially at the cost of extra compute
 # during backward (recomputes forward activations). Turn this on first if
@@ -103,10 +102,10 @@ payload_embedding_dim = 256
 # more than chunk COUNT for whether payload recovery can learn at all:
 # chunk_size=4096 with base_channels=32 (ratio 128) trained to a complete
 # flat line with zero learning; chunk_size=64 with base_channels=32 (ratio
-# 2) learned cleanly. At base_channels=64 here, chunk_size=256 keeps the
-# same safe ratio (4) while using fewer, more practical chunk counts than
-# ratio=2 would (256 vs 64 -> ~4096 vs ~16384 chunks for a 128KB payload).
-payload_chunk_size   = 256
+# 2) learned cleanly. Paired with base_channels=32 above (not 64 — see that
+# note), chunk_size=128 (ratio 4) keeps the safe ratio without also
+# multiplying num_chunks up into OOM territory again.
+payload_chunk_size   = 128
 # Dimensionality of the sinusoidal chunk-position encoding used to place
 # each payload chunk into the encoder's spatial conditioning grid. MUST
 # match [decoder] chunk_position_dim below — both use the identical
@@ -131,9 +130,9 @@ max_delta            = 4.0
 # base_channels roughly 2-4 -- see the note on [encoder] payload_chunk_size
 # for why this ratio, not chunk count, is what determines whether payload
 # recovery can learn at all.
-chunk_size         = 256
+chunk_size         = 128
 input_channels     = 4
-base_channels      = 64
+base_channels      = 32
 num_residual_blocks = 3
 attention_reduction = 8
 chunk_position_dim = 64
