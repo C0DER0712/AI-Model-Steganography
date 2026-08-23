@@ -68,76 +68,92 @@ train_host_model = false
 # Encoder architecture
 # ---------------------------------------------------------------------------
 
+# ---------------------------------------------------------------------------
+# Pipeline behaviour
+# ---------------------------------------------------------------------------
+
+[pipeline]
+# Reference-based decoding: decoder receives (modified_repr - original_repr)
+# instead of raw modified weights. See PipelineConfig.reference_decoding for
+# the full rationale. Short version: decoder's 17x17 receptive field covers
+# ~133 neighboring bits; base_channels=32 gives only 0.24 features/bit, which
+# caps accuracy at ~76% regardless of training time. The pure encoder delta
+# (bounded residual, zero natural-weight noise) eliminates the interference and
+# makes the task trivially learnable. Set false ONLY for blind-decoding research.
+reference_decoding = true
+
 [encoder]
 # NOTE: payload_dim is automatically derived from data.payload_size at runtime.
 # Do NOT set payload_dim here — any value is ignored by scripts/train.py.
 # payload_dim = <auto>  →  SUPPORTED_PAYLOAD_SIZES[payload_size] * 8
 input_channels       = 4
 output_channels      = 4
-# On Kaggle's T4/P100 (much more VRAM than an RTX 3050), raised from 16 -> 32.
-# base_channels multiplies memory directly since every conv layer operates
-# on the FULL weight-image resolution — if you go back to a small local GPU,
-# drop this back down (see gradient_checkpointing note below).
-# On T4/P100 with the num_chunks that a small chunk_size produces (see
-# payload_chunk_size below), base_channels=64 + many chunks together OOM'd
-# a 15GB GPU even at batch_size=1. Reverted to 32 (proven to fit) rather
-# than raising both base_channels and chunk count simultaneously again.
+# Architecture v2 (dense/fully-convolutional, see models/encoder.py module
+# docstring): removed chunking, per-chunk shared projection, and chunk
+# position encoding entirely — the payload is reshaped into a square bitmap
+# and every bit gets its own dedicated spatial location end-to-end, so
+# there's no more "chunk_size/base_channels ratio" to tune (that entire
+# class of failure mode no longer exists in this design).
+#
+# base_channels=32 kept at the value already proven to fit on Kaggle's
+# T4/P100 without OOM. This is a conservative choice, not a re-tuned one —
+# per-instruction, this architecture is meant to be final, not iterated on.
+# Real headroom exists to raise this later (the detector's full CNN forward
+# pass, historically the dominant memory cost, is currently disabled via
+# run_detector=False since delta=0 — see models/pipeline.py), but that's a
+# distinct experiment from finalizing this architecture, not bundled in here.
 base_channels        = 32
-num_residual_blocks  = 3
+# Bumped 3 -> 4: depth is now more directly useful than before, since every
+# block re-injects per-pixel message conditioning via SpatialFiLM (deeper
+# = more chances for the network to refine each bit's local encoding), and
+# gradient_checkpointing below keeps the memory cost of the extra block
+# roughly free (recomputes activations during backward instead of storing
+# them, so peak memory doesn't scale with depth the way it does with width).
+num_residual_blocks  = 4
 # Cuts peak activation memory substantially at the cost of extra compute
 # during backward (recomputes forward activations). Turn this on first if
 # you hit CUDA OOM, before shrinking base_channels/num_residual_blocks
 # further, since it doesn't reduce model capacity/quality.
 gradient_checkpointing = true
-payload_embedding_dim = 256
-# Width of the shared linear layer used to embed each payload chunk.
-# Independent of payload_dim by design — this is what keeps parameter count
-# small regardless of payload size (see models/encoder.py::PayloadEncoder).
-# Raised from 1024 -> 4096: fewer, larger chunks (256 instead of 1024 for a
-# 128KB payload) means less spatial-routing complexity for the encoder to
-# learn — each chunk needs its own region of the grid to be reliably
-# recoverable, and 1024 simultaneous regions was very slow to converge.
-# CRITICAL: keep chunk_size/base_channels roughly 2-4. This ratio (bits
-# each chunk's pooled feature vector must carry) turned out to matter far
-# more than chunk COUNT for whether payload recovery can learn at all:
-# chunk_size=4096 with base_channels=32 (ratio 128) trained to a complete
-# flat line with zero learning; chunk_size=64 with base_channels=32 (ratio
-# 2) learned cleanly. Paired with base_channels=32 above (not 64 — see that
-# note), chunk_size=128 (ratio 4) keeps the safe ratio without also
-# multiplying num_chunks up into OOM territory again.
-payload_chunk_size   = 128
-# Dimensionality of the sinusoidal chunk-position encoding used to place
-# each payload chunk into the encoder's spatial conditioning grid. MUST
-# match [decoder] chunk_position_dim below — both use the identical
-# sinusoidal formula, and using different dims would break the encoder/
-# decoder chunk-to-region alignment.
-chunk_position_dim  = 64
+# Width of the small conv stack that gives each payload bit local context
+# before it modulates the weight features (see MessagePreparationNetwork).
+# Deliberately independent of base_channels/payload size — it only needs
+# enough capacity to extract useful local bit-pattern context, not to carry
+# the weight-image's own feature representation. 32 is a comfortably
+# generous width for a 2-layer stack operating on a single-channel input.
+message_channels     = 32
+# Number of conv layers in the message-preparation stack (see above). 2 is
+# the minimum useful depth: layer 1 lifts the raw bitmap into feature
+# space, layer 2 lets each location incorporate its immediate neighbors'
+# values before upsampling to the weight image's resolution.
+message_prep_layers  = 2
 attention_reduction  = 8
-dropout              = 0.0
-# Bound on the encoder's per-pixel residual (0-255 scale). Kept modest for
-# stealth, but too small starves the payload signal — see the encoder/
-# decoder spatial-conditioning fix in models/encoder.py and models/decoder.py.
-max_delta            = 4.0
+# Bound on the encoder's per-pixel residual (0-255 scale). Kept generous
+# (24) since gamma (distortion loss weight) is 0 during this payload-only
+# phase — nothing currently penalizes distortion, so there's no reason to
+# starve the payload signal. Pull this back down once gamma is
+# reintroduced for the full 4-objective run and stealth actually matters.
+max_delta            = 24.0
 
 # ---------------------------------------------------------------------------
 # Decoder architecture
 # ---------------------------------------------------------------------------
 
 [decoder]
-# Number of payload bits reconstructed per shared ChunkHead call. Independent
-# of payload size by design — ChunkedPayloadDecoder applies this SAME small
-# # MUST match [encoder] payload_chunk_size above, and keep chunk_size /
-# base_channels roughly 2-4 -- see the note on [encoder] payload_chunk_size
-# for why this ratio, not chunk count, is what determines whether payload
-# recovery can learn at all.
-chunk_size         = 128
+# Architecture v2 (dense/fully-convolutional, see models/decoder.py module
+# docstring): no chunk_size, no shared per-chunk MLP head, no chunk
+# position encoding, no region_pool_size — the decoder is a plain conv
+# feature extractor down to ONE output channel (a dense bit-logit map),
+# mildly pooled to the payload grid resolution. Every setting below only
+# controls the feature extractor's depth/width, exactly like a normal CNN.
 input_channels     = 4
+# Matches [encoder] base_channels — no architectural requirement that they
+# be equal, but keeping them matched avoids an unnecessary asymmetry
+# between how much capacity the encoder spends writing evidence in and how
+# much capacity the decoder spends reading it back out.
 base_channels      = 32
-num_residual_blocks = 3
+num_residual_blocks = 4
 attention_reduction = 8
-chunk_position_dim = 64
-hidden_dim         = 256
-dropout            = 0.0
 gradient_checkpointing = true
 
 # ---------------------------------------------------------------------------
@@ -171,7 +187,7 @@ delta = 1.0   # Frozen detector evasion
 # ---------------------------------------------------------------------------
 
 [training]
-max_epochs            = 300
+max_epochs            = 1000
 batch_size            = 16
 # Raised from 1e-4 -> 2e-3. At the old rate, real (fixed-architecture)
 # learning was measurably happening but far too slowly to be practical —
@@ -182,7 +198,14 @@ batch_size            = 16
 # classification/distortion/detector losses.
 learning_rate         = 2.0e-3
 weight_decay          = 1.0e-5
-gradient_clip_norm    = 1.0
+gradient_clip_norm    = 0.5
+# Was 1.0. Tightened after observing a single-batch instability spike around
+# epoch 104 of a 400-epoch run (train_loss 0.608 -> 0.644 in one epoch, ~10
+# epochs to recover) on the small 461-sample synthetic dataset. Clipping
+# bounds the update magnitude but not direction — a tighter norm reduces how
+# hard one outlier gradient can push the optimizer off course. If this
+# turns out to slow legitimate convergence too much, 0.75 is a reasonable
+# middle ground to try next.
 # Enabled by default: roughly halves activation memory on CUDA, which
 # matters a lot here since the encoder/decoder/detector process the full
 # weight-image resolution.
@@ -200,12 +223,32 @@ payload_replicas      = 1
 
 # LR scheduler: "cosine" | "step" | "reduce_on_plateau"
 scheduler             = "cosine"
-scheduler_t_max       = 50      # CosineAnnealingLR period
+# scheduler_t_max intentionally NOT set here. CosineAnnealingLR is periodic
+# past T_max (it does NOT clamp at the minimum — it keeps evaluating the
+# same cosine curve, so a mismatched T_max causes LR to ramp back up to full
+# strength mid-run, repeating every T_max epochs like an unintended warm
+# restart). Previously hardcoded to 50 here, which silently overrode
+# scripts/train.py's own default (max_epochs) on every run regardless of
+# --epochs, causing a real instability spike around epoch 80 of a 100-epoch
+# run (LR climbing back to ~65% of max right when it should have been near
+# zero). Leave unset so it always resolves to max_epochs -> exactly one
+# smooth decay across whatever run length you choose. Set explicitly only
+# if you deliberately want periodic warm-restart-style cycling.
 scheduler_step_size   = 10      # StepLR step
 scheduler_gamma       = 0.5     # StepLR / ReduceLROnPlateau decay factor
 
 # Set to null to disable early stopping.
-early_stopping_patience = 10
+early_stopping_patience = 50
+# Was 10. Seen empirically: a single hard/outlier batch (461-sample synthetic
+# dataset, ~29 steps/epoch, fresh random 1,048,576-bit payload every step —
+# very little epoch-to-epoch averaging to smooth out one bad batch) can spike
+# val_loss for several epochs while Adam's per-parameter second-moment
+# estimates settle back down. Observed one such spike take ~10 epochs to
+# recover, monotonically, without yet beating the pre-spike best — patience
+# of 10 stopped training mid-recovery on a run that was otherwise still
+# improving. This is NOT the same issue as the earlier scheduler_t_max bug
+# (LR was confirmed near-constant across that spike); it's just Adam
+# reacting to one hard batch on a very small, high-variance dataset.
 
 log_every_n_steps     = 10
 save_best_only        = false

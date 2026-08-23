@@ -1,4 +1,3 @@
-#!/usr/bin/env python3
 """Training entry point for the steganographic embedding pipeline.
 
 Usage
@@ -273,35 +272,29 @@ def main(argv: list[str] | None = None) -> int:
     # ---- Build encoder / decoder configs ----
     # payload_dim MUST equal payload_bits (it's the actual input length) — it
     # is NOT read from the TOML [encoder] section, to prevent mismatches.
-    # chunk_size / payload_chunk_size are intentionally NOT tied to
-    # payload_bits: they control the width of a shared, reused linear layer
-    # (see models/encoder.py::PayloadEncoder and models/decoder.py::ChunkHead).
-    # Setting them equal to payload_bits collapses "chunked" into one giant
-    # dense layer — hundreds of millions of params for large payloads.
+    # Architecture v2 (dense/fully-convolutional): no chunking, no shared
+    # per-chunk MLP head. Payload is reshaped into a square bitmap and
+    # processed/decoded with full spatial correspondence throughout — see
+    # models/encoder.py and models/decoder.py module docstrings for why.
     encoder_cfg = EncoderConfig(
         payload_dim=payload_bits,
         base_channels=enc_sec.get("base_channels", 64),
         num_residual_blocks=enc_sec.get("num_residual_blocks", 4),
-        payload_embedding_dim=enc_sec.get("payload_embedding_dim", 256),
-        payload_chunk_size=enc_sec.get("payload_chunk_size", 1024),
-        chunk_position_dim=enc_sec.get("chunk_position_dim", 64),
+        message_channels=enc_sec.get("message_channels", 32),
+        message_prep_layers=enc_sec.get("message_prep_layers", 2),
         attention_reduction=enc_sec.get("attention_reduction", 8),
-        dropout=enc_sec.get("dropout", 0.0),
         max_delta=enc_sec.get("max_delta", 1.0),
         gradient_checkpointing=enc_sec.get("gradient_checkpointing", False),
     )
     decoder_cfg = DecoderConfig(
-        chunk_size=dec_sec.get("chunk_size", 1024),
         base_channels=dec_sec.get("base_channels", 64),
         num_residual_blocks=dec_sec.get("num_residual_blocks", 4),
         attention_reduction=dec_sec.get("attention_reduction", 8),
-        chunk_position_dim=dec_sec.get("chunk_position_dim", 64),
-        hidden_dim=dec_sec.get("hidden_dim", 256),
-        dropout=dec_sec.get("dropout", 0.0),
         gradient_checkpointing=dec_sec.get("gradient_checkpointing", False),
     )
 
     # ---- Build pipeline config ----
+    pipeline_sec = file_cfg.get("pipeline", {})
     pipeline_cfg = PipelineConfig(
         host_model_name=_resolve(args.host_model, host_sec.get("name"), "resnet18"),
         host_model_num_classes=_resolve(args.num_classes, host_sec.get("num_classes"), default_num_classes),
@@ -311,6 +304,10 @@ def main(argv: list[str] | None = None) -> int:
         payload_replicas=_resolve(args.payload_replicas, train_sec.get("payload_replicas"), 1),
         encoder=encoder_cfg,
         decoder=decoder_cfg,
+        # Reference-based decoding: decoder receives (modified - original) instead
+        # of the raw modified representation. See PipelineConfig.reference_decoding.
+        # Default True — the correct permanent design for keyed model steganography.
+        reference_decoding=pipeline_sec.get("reference_decoding", True),
     )
 
     # ---- Build loss weights ----

@@ -1,8 +1,28 @@
-"""Scalable chunk-based payload decoder.
+"""Dense fully-convolutional payload decoder.
 
-The decoder maps a modified Model-XRay weight representation back to benign
-payload bits. It avoids a single huge output layer by reconstructing payloads
-chunk by chunk with a shared prediction head.
+DESIGN NOTE (architecture v2 — dense/fully-convolutional):
+The previous version pooled each payload chunk's spatial region down to a
+single averaged feature vector, then a shared `ChunkHead` MLP had to
+reconstruct many independent bits (e.g. 64+) from that one vector. That is
+a genuine information bottleneck: averaging over a region and then asking
+an MLP to disentangle multiple unrelated bits from the result throws away
+most of the spatial detail the encoder could have used, and caps
+achievable accuracy regardless of training time (see models/encoder.py's
+design note for the matching bottleneck on the encoder side, and the full
+reasoning for why this task needs a Baluja-2017-style dense architecture
+rather than a HiDDeN-style pooled/redundant one).
+
+This version removes chunking, region pooling into shared vectors, and the
+shared MLP head entirely. The decoder is a plain convolutional feature
+extractor followed by a single 1x1 convolution down to ONE output channel
+— a dense bit-logit map, exactly matching Baluja's reveal network shape.
+That single-channel map is then mildly average-pooled down to the payload
+grid resolution (the same grid the encoder used to lay out its bitmap),
+which acts as light antialiasing over each bit's local pixel neighborhood
+rather than aggregating many unrelated bits into one shared vector. No
+chunk-position encoding is needed: spatial correspondence between a decoded
+grid cell and its bit is now direct and positional, not something a shared
+head has to reconstruct.
 """
 
 from __future__ import annotations
@@ -19,17 +39,13 @@ from utils.payload import tensor_to_payload
 
 @dataclass(frozen=True)
 class DecoderConfig:
-    """Configuration for `ChunkedPayloadDecoder`.
+    """Configuration for `DensePayloadDecoder`.
 
     Attributes:
         input_channels: Number of input Model-XRay representation channels.
         base_channels: Width of the convolutional feature extractor.
         num_residual_blocks: Number of residual CNN blocks in the extractor.
         attention_reduction: Reduction ratio for channel attention.
-        chunk_size: Number of payload bits reconstructed per shared-head call.
-        chunk_position_dim: Size of sinusoidal chunk-position features.
-        hidden_dim: Hidden width of the shared chunk reconstruction head.
-        dropout: Dropout probability in the chunk reconstruction head.
         gradient_checkpointing: If true, wraps each residual block in
             `torch.utils.checkpoint.checkpoint` to cut peak activation
             memory at the cost of extra compute during backward. See
@@ -40,10 +56,6 @@ class DecoderConfig:
     base_channels: int = 64
     num_residual_blocks: int = 4
     attention_reduction: int = 8
-    chunk_size: int = 1024
-    chunk_position_dim: int = 64
-    hidden_dim: int = 256
-    dropout: float = 0.0
     gradient_checkpointing: bool = False
 
 
@@ -122,69 +134,22 @@ class ResidualDecoderBlock(nn.Module):
         return residual + features
 
 
-class ChunkHead(nn.Module):
-    """Shared MLP head that predicts one payload chunk at a time.
+class DensePayloadDecoder(nn.Module):
+    """Decode payload bits from modified Model-XRay weight representations.
 
-    Takes per-chunk REGIONAL features (distinct per chunk), not a single
-    global feature vector broadcast identically to every chunk. Sharing one
-    global vector across all chunks gives the network no way to recover
-    payload bits it hasn't specifically memorized, since every chunk's
-    prediction would be conditioned on exactly the same evidence — see
-    `ChunkedPayloadDecoder` for how region-specific features are produced.
+    Fully convolutional, dense, per-bit prediction — see module docstring.
+    Previously named `ChunkedPayloadDecoder`; renamed because there is no
+    chunking left in this design.
     """
-
-    def __init__(
-        self,
-        feature_dim: int,
-        position_dim: int,
-        hidden_dim: int,
-        chunk_size: int,
-        dropout: float,
-    ) -> None:
-        super().__init__()
-
-        # Linear layer fuses this chunk's regional features with its position.
-        self.input_projection = nn.Linear(feature_dim + position_dim, hidden_dim)
-        # GELU gives the shared head nonlinear reconstruction capacity.
-        self.activation = nn.GELU()
-        # Dropout optionally regularizes chunk predictions.
-        self.dropout = nn.Dropout(dropout)
-        # Final linear layer predicts logits for one fixed-size bit chunk.
-        self.output_projection = nn.Linear(hidden_dim, chunk_size)
-
-    def forward(
-        self,
-        region_features: torch.Tensor,
-        chunk_positions: torch.Tensor,
-    ) -> torch.Tensor:
-        """Predict chunk logits for every requested chunk position.
-
-        Args:
-            region_features: Shape `(batch, num_chunks, feature_dim)` —
-                spatially-distinct features per chunk.
-            chunk_positions: Shape `(num_chunks, position_dim)`.
-        """
-
-        batch_size, num_chunks, _ = region_features.shape
-        positions = chunk_positions.unsqueeze(0).expand(batch_size, num_chunks, -1)
-        hidden = torch.cat([region_features, positions], dim=-1)
-        hidden = self.input_projection(hidden)
-        hidden = self.activation(hidden)
-        hidden = self.dropout(hidden)
-        return self.output_projection(hidden)
-
-
-class ChunkedPayloadDecoder(nn.Module):
-    """Decode payload bits from modified Model-XRay weight representations."""
 
     def __init__(self, config: DecoderConfig) -> None:
         super().__init__()
         _validate_config(config)
         self.config = config
 
-        # Stem projects four Model-XRay channels into decoder feature space.
+        # Stem projects four byte channels into a learned feature space.
         self.stem = ConvNormActivation(config.input_channels, config.base_channels)
-        # Residual blocks extract evidence without tying parameters to payload length.
+        # Residual blocks extract payload-reconstruction evidence.
         self.blocks = nn.ModuleList(
             [
                 ResidualDecoderBlock(
@@ -194,34 +159,31 @@ class ChunkedPayloadDecoder(nn.Module):
                 for _ in range(config.num_residual_blocks)
             ]
         )
-        # ChunkHead is shared across all chunks, keeping parameter count scalable.
-        self.chunk_head = ChunkHead(
-            feature_dim=config.base_channels,
-            position_dim=config.chunk_position_dim,
-            hidden_dim=config.hidden_dim,
-            chunk_size=config.chunk_size,
-            dropout=config.dropout,
-        )
+        # Single 1x1 conv down to ONE channel: a dense bit-logit map, the
+        # same spatial size as the weight image. No shared MLP head, no
+        # multi-bit-per-vector reconstruction — each spatial location's
+        # pooled value (see forward()) directly IS one bit's logit.
+        self.logit_projection = nn.Conv2d(config.base_channels, 1, kernel_size=1)
 
     def forward(self, weight_representation: torch.Tensor, num_bits: int) -> torch.Tensor:
-        """Return chunked payload logits.
+        """Reconstruct payload logits from a weight representation.
 
         Args:
             weight_representation: Tensor with shape `(batch, 4, height, width)`.
-            num_bits: Number of payload bits to reconstruct.
+            num_bits: Number of real payload bits to reconstruct (before
+                padding to a square grid).
 
         Returns:
-            Logits with shape `(batch, num_chunks, chunk_size)`. The final chunk
-            may include padded logits beyond `num_bits`.
-
-        Raises:
-            ValueError: If inputs do not match the decoder configuration.
+            Tensor with shape `(batch, grid_side * grid_side)` — bit logits
+            in row-major grid order, matching the encoder's bitmap layout.
+            Callers slice to `[:, :num_bits]` to drop grid padding.
         """
 
         self._validate_inputs(weight_representation, num_bits)
-        num_chunks = math.ceil(num_bits / self.config.chunk_size)
+        original_dtype = weight_representation.dtype
 
         features = self.stem(weight_representation.to(dtype=torch.float32))
+
         use_checkpoint = self.config.gradient_checkpointing and self.training
         for block in self.blocks:
             if use_checkpoint:
@@ -231,23 +193,18 @@ class ChunkedPayloadDecoder(nn.Module):
             else:
                 features = block(features)
 
-        # Pool into a grid_side x grid_side grid of REGIONS (instead of one
-        # global vector) so each chunk gets spatially-distinct evidence.
-        # grid_side matches the encoder's spatial FiLM conditioning grid
-        # (see WeightPayloadEncoder), so region i here corresponds to the
-        # same image region chunk i's payload bits were embedded into.
-        grid_side = math.ceil(math.sqrt(num_chunks))
-        region_grid = F.adaptive_avg_pool2d(features, output_size=(grid_side, grid_side))
-        # (batch, channels, grid_side, grid_side) -> (batch, grid_side*grid_side, channels)
-        region_features = region_grid.flatten(start_dim=2).transpose(1, 2)
-        region_features = region_features[:, :num_chunks, :]
+        logit_map = self.logit_projection(features)  # (batch, 1, H, W)
 
-        positions = sinusoidal_chunk_positions(
-            num_chunks=num_chunks,
-            dim=self.config.chunk_position_dim,
-            device=weight_representation.device,
-        )
-        return self.chunk_head(region_features, positions)
+        # Mild average-pool down to the payload grid resolution: this
+        # antialiases over each bit's own local pixel neighborhood (the
+        # weight image is naturally higher-resolution than the payload
+        # grid — see encoder module docstring), NOT an aggregation of many
+        # unrelated bits into a shared vector like the previous design.
+        grid_side = math.ceil(math.sqrt(num_bits))
+        pooled = F.adaptive_avg_pool2d(logit_map, output_size=(grid_side, grid_side))
+        logits = pooled.reshape(pooled.shape[0], grid_side * grid_side)
+
+        return logits.to(dtype=original_dtype) if original_dtype.is_floating_point else logits
 
     @torch.no_grad()
     def decode(
@@ -268,7 +225,7 @@ class ChunkedPayloadDecoder(nn.Module):
         """
 
         logits = self.forward(weight_representation, num_bits)
-        bits = (logits.reshape(logits.shape[0], -1)[:, :num_bits] > threshold)
+        bits = logits[:, :num_bits] > threshold
         return bits.to(dtype=torch.uint8).cpu()
 
     @torch.no_grad()
@@ -314,35 +271,34 @@ class ChunkedPayloadDecoder(nn.Module):
             raise ValueError("num_bits must be positive.")
 
 
-def build_decoder(config: DecoderConfig | None = None) -> ChunkedPayloadDecoder:
-    """Build a `ChunkedPayloadDecoder` from an optional configuration."""
+def build_decoder(config: DecoderConfig | None = None) -> DensePayloadDecoder:
+    """Build a `DensePayloadDecoder` from an optional configuration."""
 
-    return ChunkedPayloadDecoder(config or DecoderConfig())
+    return DensePayloadDecoder(config or DecoderConfig())
 
 
 def decode(logits: torch.Tensor, num_bits: int, threshold: float = 0.0) -> torch.Tensor:
-    """Threshold chunked logits into payload bits.
+    """Threshold dense logits into payload bits.
 
     Args:
-        logits: Tensor with shape `(batch, num_chunks, chunk_size)`.
-        num_bits: Number of real bits to keep after trimming padded chunk space.
+        logits: Tensor with shape `(batch, grid_side * grid_side)`.
+        num_bits: Number of real bits to keep after trimming grid padding.
         threshold: Logit threshold for binary reconstruction.
 
     Returns:
         CPU `torch.uint8` tensor with shape `(batch, num_bits)`.
     """
 
-    if logits.ndim != 3:
-        raise ValueError("logits must have shape (batch, num_chunks, chunk_size).")
-    flat = logits.reshape(logits.shape[0], -1)
-    if num_bits <= 0 or num_bits > flat.shape[1]:
+    if logits.ndim != 2:
+        raise ValueError("logits must have shape (batch, grid_side * grid_side).")
+    if num_bits <= 0 or num_bits > logits.shape[1]:
         raise ValueError("num_bits must be positive and fit within logits.")
 
-    return (flat[:, :num_bits] > threshold).to(dtype=torch.uint8).cpu()
+    return (logits[:, :num_bits] > threshold).to(dtype=torch.uint8).cpu()
 
 
 def reconstruct_payload(logits: torch.Tensor, num_bits: int, threshold: float = 0.0) -> list[bytes]:
-    """Convert chunked logits into reconstructed payload bytes."""
+    """Convert dense logits into reconstructed payload bytes."""
 
     if num_bits % 8 != 0:
         raise ValueError("num_bits must be divisible by 8 to reconstruct bytes.")
@@ -373,30 +329,6 @@ def payload_reconstruction_accuracy(
     return 1.0 - bit_error_rate(predicted_bits, target_bits)
 
 
-def sinusoidal_chunk_positions(
-    num_chunks: int,
-    dim: int,
-    device: torch.device | str | None = None,
-) -> torch.Tensor:
-    """Create deterministic sinusoidal chunk-position encodings."""
-
-    if num_chunks <= 0:
-        raise ValueError("num_chunks must be positive.")
-    if dim <= 0:
-        raise ValueError("dim must be positive.")
-
-    positions = torch.arange(num_chunks, device=device, dtype=torch.float32).unsqueeze(1)
-    frequencies = torch.exp(
-        torch.arange(0, dim, 2, device=device, dtype=torch.float32)
-        * (-math.log(10000.0) / dim)
-    )
-    encodings = torch.zeros(num_chunks, dim, device=device, dtype=torch.float32)
-    encodings[:, 0::2] = torch.sin(positions * frequencies)
-    if dim > 1:
-        encodings[:, 1::2] = torch.cos(positions * frequencies[: encodings[:, 1::2].shape[1]])
-    return encodings
-
-
 def _num_groups(channels: int) -> int:
     for groups in (32, 16, 8, 4, 2):
         if channels % groups == 0:
@@ -413,11 +345,3 @@ def _validate_config(config: DecoderConfig) -> None:
         raise ValueError("num_residual_blocks must be non-negative.")
     if config.attention_reduction <= 0:
         raise ValueError("attention_reduction must be positive.")
-    if config.chunk_size <= 0:
-        raise ValueError("chunk_size must be positive.")
-    if config.chunk_position_dim <= 0:
-        raise ValueError("chunk_position_dim must be positive.")
-    if config.hidden_dim <= 0:
-        raise ValueError("hidden_dim must be positive.")
-    if not 0.0 <= config.dropout < 1.0:
-        raise ValueError("dropout must be in the range [0.0, 1.0).")

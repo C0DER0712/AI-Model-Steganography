@@ -1,6 +1,6 @@
 """Model architectures for the defensive research codebase."""
 
-from models.decoder import ChunkedPayloadDecoder, DecoderConfig, build_decoder
+from models.decoder import DensePayloadDecoder, DecoderConfig, build_decoder
 from models.encoder import EncoderConfig, WeightPayloadEncoder, build_encoder
 from models.host_models import HostModelAdapter, HostModelConfig, HostModelName, build_host_model
 from models.srnet_detector import SRNetConfig, SRNetDetector, build_srnet_detector
@@ -9,7 +9,7 @@ from models.srnet_detector import SRNetConfig, SRNetDetector, build_srnet_detect
 # They are not re-exported here to avoid a circular import through training.__init__.
 
 __all__ = [
-    "ChunkedPayloadDecoder",
+    "DensePayloadDecoder",
     "DecoderConfig",
     "EncoderConfig",
     "HostModelAdapter",

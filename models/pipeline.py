@@ -34,7 +34,7 @@ import torch
 from torch import nn
 
 from evaluation.differentiable_detector import DifferentiableDetector, DifferentiableDetectorConfig
-from models.decoder import ChunkedPayloadDecoder, DecoderConfig, build_decoder
+from models.decoder import DensePayloadDecoder, DecoderConfig, build_decoder
 from models.encoder import EncoderConfig, WeightPayloadEncoder, build_encoder
 from models.host_models import HostModelAdapter, HostModelConfig, HostModelName, build_host_model
 from training.losses import LossInputs
@@ -80,19 +80,67 @@ class PipelineConfig:
     detector: DifferentiableDetectorConfig = None  # type: ignore[assignment]
     payload_bits: int = 8192  # 1024 bytes
     payload_replicas: int = 1
+    # Skip the corresponding forward pass entirely (not just exclude it from
+    # the loss afterward) when the matching loss weight is 0. The detector's
+    # full CNN forward pass over the entire weight-image is the single most
+    # expensive thing `forward()` runs — computing it when `delta=0` (its
+    # loss weight) burns the same memory/compute for zero training signal.
+    # Same idea for classification when `alpha=0`: skips the STE weight
+    # reconstruction and the host model's functional_forward. Both default
+    # True (original always-run behavior). `SteganographyExperiment.run`
+    # sets these automatically from `cfg.loss_weights` each run, so turning
+    # alpha/delta back on for the full 4-objective run automatically turns
+    # the forward passes back on too — no manual toggling needed.
+    run_classification: bool = True
+    run_detector: bool = True
+    # -------------------------------------------------------------------------
+    # Reference-based decoding (default: True — the correct final design)
+    # -------------------------------------------------------------------------
+    # When True, the decoder receives `modified_repr − original_repr` (the
+    # encoder's pure delta residual) instead of `modified_repr` itself.
+    #
+    # WHY THIS IS THE RIGHT CHOICE:
+    # The decoder's 17×17-pixel receptive field (4 residual blocks × 2 3×3
+    # convs = 8 hops) covers ~133 adjacent bits simultaneously at the 1.47
+    # pixels/bit density of a 1507×1507 weight image. With base_channels=32
+    # that gives only 0.24 features per interfering bit — the network
+    # physically cannot disentangle 133 overlapping signals in 32 channels,
+    # which is why training plateaus at ~76% accuracy regardless of how long
+    # it runs. The natural weight texture (the IEEE754 bit patterns of the
+    # original weights) acts as structured interference on top of the
+    # encoder's subtle per-pixel perturbations.
+    #
+    # Passing modified − original eliminates the interference completely:
+    # the residual is bounded in [-max_delta, +max_delta] per byte channel,
+    # has zero natural-weight-texture noise, and directly IS the encoder's
+    # signal. The decoder then just needs to learn the sign of the pooled
+    # residual per bit — a trivially easier task that converges fast and
+    # reaches near-zero BER.
+    #
+    # THREAT MODEL:
+    # This is correct for keyed model steganography: the sender (embedder)
+    # knows the original model; the receiver (extractor) also knows the
+    # original model and uses it as a secret key. The SRNet malware detector
+    # only ever sees the modified model weights — never the original — so
+    # the evaluation scenario is unaffected. This mirrors how all practical
+    # model watermarking schemes work (e.g. Uchida et al. 2017, RivaGAN,
+    # DeepIPR).
+    #
+    # Set to False ONLY if you specifically need blind decoding (extractor
+    # has no access to the original model) — but expect ~76% BER ceiling
+    # even with deeper/wider architectures unless base_channels is
+    # dramatically increased (≥256 to get features/bit above 1.0).
+    reference_decoding: bool = True
 
     def __post_init__(self) -> None:
         # Allow None sentinels; replace with defaults sized to self.payload_bits.
         if self.encoder is None:
             object.__setattr__(self, "encoder", EncoderConfig(payload_dim=self.payload_bits))
         if self.decoder is None:
-            # NOTE: chunk_size is intentionally NOT derived from payload_bits.
-            # ChunkedPayloadDecoder applies one small shared head across
-            # `ceil(payload_bits / chunk_size)` chunks — setting chunk_size to
-            # the full payload size collapses this to a single dense
-            # hidden_dim x payload_bits layer (hundreds of millions of
-            # params for large payloads). DecoderConfig's own default
-            # (chunk_size=1024) keeps the head small regardless of payload size.
+            # DensePayloadDecoder's parameter count depends only on
+            # base_channels/num_residual_blocks, never on payload_bits — the
+            # old chunk_size caveat here no longer applies (see
+            # models/decoder.py's design note: chunking was removed).
             object.__setattr__(self, "decoder", DecoderConfig())
         if self.detector is None:
             object.__setattr__(self, "detector", DifferentiableDetectorConfig())
@@ -127,7 +175,7 @@ class EmbeddingPipeline(nn.Module):
             pretrained=cfg.host_model_pretrained,
         )
         self.encoder: WeightPayloadEncoder = build_encoder(cfg.encoder)
-        self.decoder: ChunkedPayloadDecoder = build_decoder(cfg.decoder)
+        self.decoder: DensePayloadDecoder = build_decoder(cfg.decoder)
         self.detector: DifferentiableDetector = DifferentiableDetector(cfg.detector)
 
         if not cfg.train_host_model:
@@ -220,34 +268,62 @@ class EmbeddingPipeline(nn.Module):
         # Shape: (num_replicas, 4, H, W)
 
         # ---- Decoder: recover payload from each replica ----
-        payload_logits = self.decoder(modified_repr_batch, self.config.payload_bits)
-        # Shape: (num_replicas, num_chunks, chunk_size) → flatten for loss
+        # Reference-based: give the decoder (modified - original) instead of
+        # the raw modified representation. The residual is the encoder's pure
+        # delta signal: bounded in [-max_delta, +max_delta] per byte channel,
+        # with zero natural-weight-texture interference. The decoder just
+        # needs to learn sign-of-pooled-residual per bit, not untangle the
+        # encoder's perturbation FROM the host model's natural weight pattern.
+        # See PipelineConfig.reference_decoding for the full rationale.
+        if self.config.reference_decoding:
+            decoder_input = modified_repr_batch - original_repr_batch
+        else:
+            decoder_input = modified_repr_batch
+        payload_logits = self.decoder(decoder_input, self.config.payload_bits)
         payload_logits_flat = payload_logits.reshape(num_replicas, -1)[
             :, : self.config.payload_bits
         ]
 
         # ---- Detector: score the modified representation ----
         # The detector is frozen but its forward pass is differentiable w.r.t. input.
-        detector_logits = self.detector(modified_repr_batch).squeeze(-1)  # (num_replicas,)
-        # Target: predict as benign (label = 0) to fool the detector.
-        detector_targets = torch.zeros_like(detector_logits)
+        # Skipped entirely (not just excluded from the loss) when delta=0 —
+        # see PipelineConfig.run_detector. This is the single most expensive
+        # forward pass in the pipeline (a full CNN over the whole weight
+        # image), so running it for zero training signal is pure waste.
+        if self.config.run_detector:
+            detector_logits = self.detector(modified_repr_batch).squeeze(-1)  # (num_replicas,)
+            # Target: predict as benign (label = 0) to fool the detector.
+            detector_targets = torch.zeros_like(detector_logits)
+        else:
+            detector_logits = None
+            detector_targets = None
 
         # ---- Classification with modified weights (STE) ----
-        # Use the first sample's modified representation for weight reconstruction.
-        modified_repr_single = modified_repr_batch[0]  # (4, H, W)
-        modified_flat = _ChannelsToWeightsSTE.apply(
-            modified_repr_single, len(weight_records), num_weight_values
-        )
-        # Rebuild parameter dict for functional_call.
-        modified_params = _rebuild_params(
-            modified_flat, weight_records, self.host_model.model
-        )
-        # Run classification with modified weights; gradient flows through functional_call.
-        classification_logits = self.host_model.functional_forward(images, modified_params)
+        # Skipped entirely (not just excluded from the loss) when alpha=0 —
+        # see PipelineConfig.run_classification. Avoids the STE weight
+        # reconstruction (which round-trips through CPU/numpy) and the host
+        # model's functional_forward when classification isn't contributing
+        # to the loss anyway.
+        if self.config.run_classification:
+            # Use the first sample's modified representation for weight reconstruction.
+            modified_repr_single = modified_repr_batch[0]  # (4, H, W)
+            modified_flat = _ChannelsToWeightsSTE.apply(
+                modified_repr_single, len(weight_records), num_weight_values
+            )
+            # Rebuild parameter dict for functional_call.
+            modified_params = _rebuild_params(
+                modified_flat, weight_records, self.host_model.model
+            )
+            # Run classification with modified weights; gradient flows through functional_call.
+            classification_logits = self.host_model.functional_forward(images, modified_params)
+            classification_targets = labels
+        else:
+            classification_logits = None
+            classification_targets = None
 
         return LossInputs(
             classification_logits=classification_logits,
-            classification_targets=labels,
+            classification_targets=classification_targets,
             payload_logits=payload_logits_flat,
             payload_targets=payload_bits.reshape(num_replicas, -1)[
                 :, : self.config.payload_bits
@@ -289,12 +365,18 @@ class EmbeddingPipeline(nn.Module):
     def decode(
         self,
         modified_repr: torch.Tensor,
+        original_repr: torch.Tensor | None = None,
         num_bits: int | None = None,
     ) -> torch.Tensor:
         """Decode payload bits from a modified representation.
 
         Args:
             modified_repr: Tensor with shape ``(B, 4, H, W)``.
+            original_repr: Original (unmodified) weight representation with the
+                same shape as ``modified_repr``. Required when
+                ``config.reference_decoding=True`` (the default). If not
+                provided and reference_decoding is True, the pipeline
+                computes it from the cached host model weights automatically.
             num_bits: Number of bits to decode; defaults to ``payload_bits``
                 in :attr:`config`.
 
@@ -304,7 +386,27 @@ class EmbeddingPipeline(nn.Module):
         self.eval()
         with torch.no_grad():
             bits = num_bits or self.config.payload_bits
-            return self.decoder.decode(modified_repr, bits)
+            if self.config.reference_decoding:
+                if original_repr is None:
+                    # Compute from cache (host model weights are frozen and
+                    # never change after __init__, so the cached repr is valid).
+                    device = modified_repr.device
+                    if self._cached_original_repr_buf is not None:
+                        orig = self._cached_original_repr_buf.to(device).float()
+                    else:
+                        weight_records = extract_weights(self.host_model.model)
+                        flat = flatten_weights(weight_records).to(device)
+                        orig = torch.from_numpy(
+                            weights_to_channels(flat).astype("float32")
+                        ).to(device)
+                    # Expand to match batch dim of modified_repr
+                    orig = orig.unsqueeze(0).expand_as(modified_repr)
+                else:
+                    orig = original_repr.to(modified_repr.device).float()
+                decoder_input = modified_repr.float() - orig
+            else:
+                decoder_input = modified_repr
+            return self.decoder.decode(decoder_input, bits)
 
 
 def build_pipeline(config: PipelineConfig | None = None) -> EmbeddingPipeline:

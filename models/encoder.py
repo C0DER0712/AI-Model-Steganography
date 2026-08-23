@@ -1,9 +1,35 @@
 """Configurable encoder for Model-XRay weight representations.
 
-The encoder receives a four-channel Model-XRay-style weight image and a benign
-payload tensor, then predicts a continuous residual update to the weight image.
-It does not perform handcrafted bit or LSB replacement; all modifications are
-learned through convolution, payload conditioning, and attention.
+DESIGN NOTE (architecture v2 — dense/fully-convolutional):
+The previous version chunked the payload into fixed-size groups, projected
+each chunk through one shared linear layer into a single embedding, then
+broadcast that ONE embedding uniformly across an entire spatial region via
+FiLM. That forces many independent bits (e.g. 64+ per chunk) to share one
+bottleneck vector on the way in, mirrored by a matching bottleneck on the
+decoder side (see models/decoder.py's design note). Empirically this capped
+payload-recovery accuracy well below 100% (~66-76% observed at 128KB-1MB
+scale) no matter how long training ran or how the chunk/region-pooling
+parameters were tuned — it's a structural ceiling, not a training issue.
+
+This version follows Baluja et al. 2017 ("Hiding Images in Plain Sight")
+rather than HiDDeN (Zhu et al. 2018): HiDDeN is built for tiny payloads
+(30-100 bits) that must survive lossy image transforms, and achieves
+robustness by spreading one small message redundantly across an entire
+image, decoded via global pooling. That is the opposite of what a
+1MB-scale, no-lossy-channel payload needs. Baluja's reveal network is
+fully convolutional end-to-end with no pooling-to-a-vector step anywhere —
+every output element is predicted from its own local receptive field,
+never mixed with unrelated message content through a shared bottleneck.
+
+Concretely: the payload is reshaped into a 2D bitmap, given local context
+by a small conv stack (`MessagePreparationNetwork`), then upsampled
+(nearest, to preserve hard bit boundaries) to the weight image's native
+resolution. Every residual block is modulated by this per-pixel feature
+map via `SpatialFiLM` — a 1x1 conv predicting scale/shift AT EACH
+LOCATION, never a single pooled vector broadcast everywhere. No chunk
+grouping, no shared per-chunk projection, no chunk-position encoding is
+needed anymore: spatial correspondence between a bit and its evidence is
+now direct and structural, not something a shared MLP has to reconstruct.
 """
 
 from __future__ import annotations
@@ -27,18 +53,14 @@ class EncoderConfig:
         payload_dim: Number of payload tensor elements expected per sample.
         base_channels: Width of the convolutional feature backbone.
         num_residual_blocks: Number of payload-conditioned residual CNN blocks.
-        payload_embedding_dim: Hidden size used to encode payload tensors.
-        payload_chunk_size: Chunk width used by the payload embedding's shared
-            linear layer. Keeping this fixed (independent of `payload_dim`)
-            is what keeps parameter count from scaling with payload size —
-            see `PayloadEncoder` for details.
-        chunk_position_dim: Dimensionality of the sinusoidal chunk-position
-            encoding used to tag each payload chunk and place it in the
-            spatial FiLM conditioning grid. Should match the decoder's
-            `DecoderConfig.chunk_position_dim` for consistent chunk-to-region
-            alignment between encoder and decoder.
+        message_channels: Width of the message-preparation conv stack that
+            processes the payload bitmap before it modulates the weight
+            features. Independent of `base_channels` — this only needs
+            enough capacity to give each bit useful local context, not to
+            carry the whole weight-image feature representation.
+        message_prep_layers: Number of conv layers in the message-preparation
+            stack (minimum 1, which is just the input stem).
         attention_reduction: Reduction ratio in channel-attention MLPs.
-        dropout: Dropout probability applied to payload embeddings.
         max_delta: Scale applied to the predicted residual update.
         gradient_checkpointing: If true, wraps each residual block in
             `torch.utils.checkpoint.checkpoint`, trading extra compute
@@ -56,11 +78,9 @@ class EncoderConfig:
     payload_dim: int = 1024
     base_channels: int = 64
     num_residual_blocks: int = 4
-    payload_embedding_dim: int = 256
-    payload_chunk_size: int = 1024
-    chunk_position_dim: int = 64
+    message_channels: int = 32
+    message_prep_layers: int = 2
     attention_reduction: int = 8
-    dropout: float = 0.0
     max_delta: float = 1.0
     gradient_checkpointing: bool = False
 
@@ -91,157 +111,71 @@ class ConvNormActivation(nn.Module):
         return self.activation(self.norm(self.conv(inputs)))
 
 
-class PayloadEncoder(nn.Module):
-    """Encodes payload bits into PER-CHUNK conditioning vectors.
+class MessagePreparationNetwork(nn.Module):
+    """Gives each payload bit local spatial context before it modulates features.
 
-    A naive `nn.Linear(payload_dim, embedding_dim)` scales with payload size —
-    for a 128KB payload (1,048,576 bits) at embedding_dim=256 that alone is
-    ~268M parameters, dwarfing everything else in the model.
-
-    Instead, the payload is split into fixed-size chunks and a single shared
-    linear layer embeds every chunk with the *same* weights (parameter count
-    depends only on `chunk_size`, never on `payload_dim`). This mirrors the
-    decoder's `ChunkHead`, which is shared across chunks by design.
-
-    Chunk embeddings are kept SEPARATE per chunk (not mean-pooled into one
-    global vector) and each is tagged with a sinusoidal chunk-position
-    encoding. `FiLM` then uses these per-chunk embeddings to modulate a
-    DIFFERENT spatial region per chunk — see `FiLM` for why a single pooled
-    vector broadcast everywhere cannot support recovering many independent
-    payload chunks.
+    Takes the payload reshaped as a 2D bitmap (one bit per grid cell) and
+    processes it through a small conv stack, entirely independently per
+    location aside from the receptive field grown by the conv kernels
+    themselves — there is no pooling, flattening, or shared-vector step
+    here. Output has the SAME spatial layout as the input bitmap (one
+    feature vector per bit, at that bit's own grid location), just enriched
+    with local context. This mirrors the "prep network" in Baluja et al.
+    2017, which processes the secret image with conv layers before it ever
+    touches the cover image.
     """
 
-    def __init__(
-        self,
-        payload_dim: int,
-        embedding_dim: int,
-        dropout: float,
-        chunk_size: int = 1024,
-        position_dim: int = 64,
-    ) -> None:
+    def __init__(self, message_channels: int, num_layers: int) -> None:
         super().__init__()
+        num_layers = max(1, num_layers)
 
-        self.payload_dim = payload_dim
-        self.chunk_size = min(chunk_size, payload_dim)
-        self.num_chunks = math.ceil(payload_dim / self.chunk_size)
-        self.padded_dim = self.num_chunks * self.chunk_size
-        self.position_dim = position_dim
-
-        # Shared linear layer embeds every payload chunk (plus its position)
-        # with identical weights — this keeps parameter count independent
-        # of payload_dim, unlike a single dense payload_dim x embedding_dim layer.
-        self.chunk_projection = nn.Linear(self.chunk_size + position_dim, embedding_dim)
-        # GELU keeps the payload pathway differentiable and expressive.
-        self.activation = nn.GELU()
-        # Dropout optionally regularizes payload conditioning.
-        self.dropout = nn.Dropout(dropout)
-        # Linear layer refines each chunk embedding used by FiLM blocks.
-        self.output_projection = nn.Linear(embedding_dim, embedding_dim)
-
-    def forward(self, payload: torch.Tensor) -> torch.Tensor:
-        """Encode payload tensors with shape `(batch, payload_dim)`.
-
-        Returns:
-            Tensor with shape `(batch, num_chunks, embedding_dim)` — one
-            distinct embedding PER CHUNK, not pooled into a single vector.
-        """
-
-        payload = payload.to(dtype=torch.float32)
-        if self.padded_dim != self.payload_dim:
-            payload = F.pad(payload, (0, self.padded_dim - self.payload_dim))
-
-        # (batch, payload_dim) -> (batch, num_chunks, chunk_size)
-        chunks = payload.view(payload.shape[0], self.num_chunks, self.chunk_size)
-
-        positions = sinusoidal_chunk_positions(
-            num_chunks=self.num_chunks, dim=self.position_dim, device=payload.device
+        layers = [ConvNormActivation(1, message_channels)]
+        layers.extend(
+            ConvNormActivation(message_channels, message_channels)
+            for _ in range(num_layers - 1)
         )
-        positions = positions.unsqueeze(0).expand(payload.shape[0], -1, -1)
-        chunks_with_position = torch.cat([chunks, positions], dim=-1)
+        self.net = nn.Sequential(*layers)
 
-        # Shared linear layer applied identically to every chunk, kept
-        # separate per chunk (no pooling) so each retains distinct content.
-        chunk_embeddings = self.activation(self.chunk_projection(chunks_with_position))
-        chunk_embeddings = self.dropout(chunk_embeddings)
-        return self.output_projection(chunk_embeddings)  # (batch, num_chunks, embedding_dim)
+    def forward(self, bitmap: torch.Tensor) -> torch.Tensor:
+        """Process a payload bitmap with shape `(batch, 1, grid, grid)`."""
+
+        return self.net(bitmap)
 
 
-def sinusoidal_chunk_positions(
-    num_chunks: int, dim: int, device: torch.device | str | None = None
-) -> torch.Tensor:
-    """Deterministic sinusoidal position encoding for `num_chunks` chunks.
+class SpatialFiLM(nn.Module):
+    """Feature-wise linear modulation predicted independently AT EACH PIXEL.
 
-    Mirrors `models.decoder.sinusoidal_chunk_positions` exactly (duplicated
-    here rather than imported, to keep encoder.py and decoder.py independent
-    of each other) — the encoder's spatial conditioning grid and the
-    decoder's regional pooling grid must agree on chunk ordering, and using
-    the identical formula in both places is what guarantees that.
+    Unlike the previous per-chunk FiLM (one embedding broadcast uniformly
+    across an entire region, shared by every bit in that chunk), this
+    predicts scale and shift from the message feature map at every spatial
+    location via a 1x1 convolution — every bit gets its own modulation,
+    never shared with unrelated bits. The message feature map passed in is
+    already upsampled to the weight representation's resolution (see
+    `WeightPayloadEncoder.forward`), so this is a genuinely local,
+    per-position operation, not a global broadcast.
     """
 
-    position = torch.arange(num_chunks, dtype=torch.float32, device=device).unsqueeze(1)
-    div_term = torch.exp(
-        torch.arange(0, dim, 2, dtype=torch.float32, device=device)
-        * (-math.log(10000.0) / dim)
-    )
-    encoding = torch.zeros(num_chunks, dim, device=device)
-    encoding[:, 0::2] = torch.sin(position * div_term)
-    encoding[:, 1::2] = torch.cos(position * div_term[: encoding[:, 1::2].shape[1]])
-    return encoding
-
-
-class FiLM(nn.Module):
-    """Feature-wise linear modulation, applied as a SPATIALLY-VARYING map.
-
-    Each payload chunk's embedding modulates a DIFFERENT region of the
-    feature map, arranged in the same grid_side x grid_side layout the
-    decoder uses to pool regions back out (see `ChunkedPayloadDecoder`).
-    This is what allows different payload chunks to be recoverable from
-    different image regions. A single global scale/shift derived from one
-    pooled payload vector — the previous design — modulates every spatial
-    position identically regardless of which chunk a bit belongs to, which
-    gives the decoder no way to distinguish one chunk's bits from another's
-    when the payload changes between forward passes (only memorized,
-    previously-seen payloads could be "recovered", since the network had
-    learned a fixed mapping from one specific global vector to one specific
-    known payload rather than a generalizable per-chunk channel).
-    """
-
-    def __init__(self, embedding_dim: int, channels: int) -> None:
+    def __init__(self, message_channels: int, channels: int) -> None:
         super().__init__()
 
-        # Linear layer predicts per-channel scale and bias from a chunk embedding.
-        self.modulation = nn.Linear(embedding_dim, channels * 2)
+        # 1x1 convolution predicts per-pixel scale and bias from local
+        # message features — no spatial mixing here, kernel_size=1 keeps
+        # each output location dependent only on that same location's
+        # message evidence, preserving the one-bit-one-location guarantee.
+        self.modulation = nn.Conv2d(message_channels, channels * 2, kernel_size=1)
 
-    def forward(self, features: torch.Tensor, chunk_embeddings: torch.Tensor) -> torch.Tensor:
-        """Apply spatially-varying, per-chunk scale and shift.
+    def forward(self, features: torch.Tensor, message_features: torch.Tensor) -> torch.Tensor:
+        """Apply per-pixel scale and shift.
 
         Args:
             features: Shape `(batch, channels, height, width)`.
-            chunk_embeddings: Shape `(batch, num_chunks, embedding_dim)`.
+            message_features: Shape `(batch, message_channels, height, width)`,
+                already upsampled to match `features`' spatial size.
         """
 
-        batch, channels, height, width = features.shape
-        num_chunks = chunk_embeddings.shape[1]
-        grid_side = math.ceil(math.sqrt(num_chunks))
-
-        gamma_beta = self.modulation(chunk_embeddings)  # (batch, num_chunks, channels*2)
-        gamma, beta = gamma_beta.chunk(2, dim=-1)  # each (batch, num_chunks, channels)
-
-        # Scatter the num_chunks values onto a grid_side x grid_side grid
-        # (zero-padding beyond num_chunks), then nearest-upsample to the
-        # feature map's spatial size so each region gets its own
-        # chunk-specific modulation instead of one value shared everywhere.
-        pad_len = grid_side * grid_side - num_chunks
-        if pad_len > 0:
-            gamma = F.pad(gamma, (0, 0, 0, pad_len))
-            beta = F.pad(beta, (0, 0, 0, pad_len))
-        gamma_grid = gamma.transpose(1, 2).reshape(batch, channels, grid_side, grid_side)
-        beta_grid = beta.transpose(1, 2).reshape(batch, channels, grid_side, grid_side)
-
-        gamma_map = F.interpolate(gamma_grid, size=(height, width), mode="nearest")
-        beta_map = F.interpolate(beta_grid, size=(height, width), mode="nearest")
-
-        return features * (1.0 + gamma_map) + beta_map
+        gamma_beta = self.modulation(message_features)
+        gamma, beta = gamma_beta.chunk(2, dim=1)
+        return features * (1.0 + gamma) + beta
 
 
 class ChannelSpatialAttention(nn.Module):
@@ -280,30 +214,34 @@ class ChannelSpatialAttention(nn.Module):
 
 
 class PayloadConditionedResidualBlock(nn.Module):
-    """Residual CNN block conditioned on payload embeddings with attention."""
+    """Residual CNN block conditioned on per-pixel message features with attention."""
 
-    def __init__(self, channels: int, embedding_dim: int, attention_reduction: int) -> None:
+    def __init__(self, channels: int, message_channels: int, attention_reduction: int) -> None:
         super().__init__()
 
         # First convolution extracts local byte-plane features.
         self.conv1 = ConvNormActivation(channels, channels)
+        # SpatialFiLM injects per-pixel payload information at this depth —
+        # re-injecting at every block (not just once at the input) mirrors
+        # HiDDeN's finding that repeated conditioning at multiple depths
+        # improves recoverability, applied here per-pixel rather than
+        # per-chunk-vector.
+        self.film = SpatialFiLM(message_channels, channels)
         # Second convolution refines features before residual addition.
         self.conv2 = ConvNormActivation(channels, channels)
-        # FiLM injects payload information without fixed bit-placement rules.
-        self.film = FiLM(embedding_dim, channels)
         # Attention learns useful channels and positions for representation edits.
         self.attention = ChannelSpatialAttention(channels, attention_reduction)
 
     def forward(
         self,
         features: torch.Tensor,
-        payload_embedding: torch.Tensor,
+        message_features: torch.Tensor,
     ) -> torch.Tensor:
         """Run a payload-conditioned residual update."""
 
         residual = features
         features = self.conv1(features)
-        features = self.film(features, payload_embedding)
+        features = self.film(features, message_features)
         features = self.conv2(features)
         features = self.attention(features)
         return residual + features
@@ -316,14 +254,14 @@ class WeightPayloadEncoder(nn.Module):
         super().__init__()
         _validate_config(config)
         self.config = config
+        self.grid_side = math.ceil(math.sqrt(config.payload_dim))
+        self.padded_dim = self.grid_side * self.grid_side
 
-        # PayloadEncoder turns random payload bits into global conditioning.
-        self.payload_encoder = PayloadEncoder(
-            payload_dim=config.payload_dim,
-            embedding_dim=config.payload_embedding_dim,
-            dropout=config.dropout,
-            chunk_size=config.payload_chunk_size,
-            position_dim=config.chunk_position_dim,
+        # MessagePreparationNetwork gives every bit local context, keeping
+        # its own dedicated grid location throughout (no pooling/flattening).
+        self.message_prep = MessagePreparationNetwork(
+            message_channels=config.message_channels,
+            num_layers=config.message_prep_layers,
         )
         # Stem projects four byte channels into a learned feature space.
         self.stem = ConvNormActivation(config.input_channels, config.base_channels)
@@ -332,7 +270,7 @@ class WeightPayloadEncoder(nn.Module):
             [
                 PayloadConditionedResidualBlock(
                     channels=config.base_channels,
-                    embedding_dim=config.payload_embedding_dim,
+                    message_channels=config.message_channels,
                     attention_reduction=config.attention_reduction,
                 )
                 for _ in range(config.num_residual_blocks)
@@ -364,20 +302,39 @@ class WeightPayloadEncoder(nn.Module):
         self._validate_inputs(weight_representation, payload)
 
         original_dtype = weight_representation.dtype
-        features = self.stem(weight_representation.to(dtype=torch.float32))
-        payload_embedding = self.payload_encoder(payload)
+        weight_representation = weight_representation.to(dtype=torch.float32)
+        _, _, height, width = weight_representation.shape
+
+        # Reshape payload into a 2D bitmap: one bit per grid cell, zero-padded
+        # to a perfect square grid. This is the ONLY reshape the payload ever
+        # undergoes — every subsequent step preserves this spatial layout.
+        payload = payload.to(dtype=torch.float32)
+        if self.padded_dim != self.config.payload_dim:
+            payload = F.pad(payload, (0, self.padded_dim - self.config.payload_dim))
+        bitmap = payload.view(payload.shape[0], 1, self.grid_side, self.grid_side)
+
+        message_features = self.message_prep(bitmap)
+        # Nearest upsampling (not bilinear) preserves hard bit boundaries —
+        # blending two different bits' feature values together at the
+        # boundary would reintroduce exactly the kind of cross-bit mixing
+        # this architecture is designed to avoid.
+        message_features = F.interpolate(
+            message_features, size=(height, width), mode="nearest"
+        )
+
+        features = self.stem(weight_representation)
 
         use_checkpoint = self.config.gradient_checkpointing and self.training
         for block in self.blocks:
             if use_checkpoint:
                 features = torch.utils.checkpoint.checkpoint(
-                    block, features, payload_embedding, use_reentrant=False
+                    block, features, message_features, use_reentrant=False
                 )
             else:
-                features = block(features, payload_embedding)
+                features = block(features, message_features)
 
         delta = torch.tanh(self.output_projection(features)) * self.config.max_delta
-        output = weight_representation.to(dtype=torch.float32) + delta
+        output = weight_representation + delta
         return output.to(dtype=original_dtype) if original_dtype.is_floating_point else output
 
     def _validate_inputs(
@@ -430,13 +387,11 @@ def _validate_config(config: EncoderConfig) -> None:
         raise ValueError("base_channels must be positive.")
     if config.num_residual_blocks < 0:
         raise ValueError("num_residual_blocks must be non-negative.")
-    if config.payload_embedding_dim <= 0:
-        raise ValueError("payload_embedding_dim must be positive.")
-    if config.payload_chunk_size <= 0:
-        raise ValueError("payload_chunk_size must be positive.")
+    if config.message_channels <= 0:
+        raise ValueError("message_channels must be positive.")
+    if config.message_prep_layers <= 0:
+        raise ValueError("message_prep_layers must be positive.")
     if config.attention_reduction <= 0:
         raise ValueError("attention_reduction must be positive.")
-    if not 0.0 <= config.dropout < 1.0:
-        raise ValueError("dropout must be in the range [0.0, 1.0).")
     if config.max_delta <= 0:
         raise ValueError("max_delta must be positive.")
