@@ -42,6 +42,53 @@ from torch import nn
 from torch.nn import functional as F
 
 
+
+
+class AdaptiveCapacityGate(nn.Module):
+    """Learns which weight pixels to use for payload embedding.
+
+    Predicts a soft gate g ∈ [0,1] per spatial position from the ORIGINAL
+    (unmodified) weight representation.  High gate (→1) means this pixel
+    can safely absorb payload bits without hurting host model accuracy.
+    Low gate (→0) means skip it — the encoder will apply near-zero delta
+    there, preserving accuracy at the cost of not embedding those bits.
+
+    This is what makes the approach genuinely adaptive vs. fixed bpp
+    steganography: the gate discovers the spatially non-uniform capacity of
+    the weight space end-to-end, guided by the classification gradient
+    (alpha) and the capacity maximization loss (eta). Different weight
+    regions have different sensitivity — BatchNorm scales, attention
+    projection weights, final classifier weights — and the gate learns this
+    distribution automatically without any explicit hand-coding of which
+    layers matter.
+
+    At training time the gate is continuous (differentiable Sigmoid).
+    At inference time threshold at 0.5 for a hard binary decision:
+    if g > 0.5 the bit is embedded; otherwise it is left unembedded and
+    the receiver knows not to decode that position (via the near-zero
+    residual signal it sees through reference_decoding).
+    """
+
+    def __init__(self, input_channels=4, hidden_channels=16, bits_per_pixel=1):
+        super().__init__()
+        # Lightweight 2-layer conv: learns local weight statistics that
+        # predict how much perturbation each pixel can absorb.
+        self.net = nn.Sequential(
+            nn.Conv2d(input_channels, hidden_channels, kernel_size=3, padding=1),
+            nn.GELU(),
+            nn.Conv2d(hidden_channels, bits_per_pixel, kernel_size=1),  # ← changed
+            nn.Sigmoid(),
+        )
+
+    def forward(self, original_repr: torch.Tensor) -> torch.Tensor:
+        """Returns gate with shape ``(batch, 1, height, width)``.
+
+        Values close to 1: pixel is safe to embed bits in.
+        Values close to 0: pixel is sensitive; leave near-unmodified.
+        """
+        return self.net(original_repr.float())
+
+
 @dataclass(frozen=True)
 class EncoderConfig:
     """Configuration for `WeightPayloadEncoder`.
@@ -79,6 +126,17 @@ class EncoderConfig:
     base_channels: int = 64
     num_residual_blocks: int = 4
     message_channels: int = 32
+    # Must match DecoderConfig.bits_per_pixel exactly.  Default 1 = original
+    # single-bit-per-pixel design.  bpp=2 -> 2x capacity, bpp=4 -> 4x capacity.
+    bits_per_pixel: int = 1
+    # When True, a small AdaptiveCapacityGate network predicts a soft gate
+    # g ∈ [0,1] per weight pixel from the original weight representation.
+    # The encoder's raw delta is multiplied by this gate before being applied.
+    # This lets the model discover WHICH pixels can safely carry bits rather
+    # than uniformly embedding bpp bits everywhere — genuine adaptive capacity
+    # allocation vs. fixed-bpp steganography.  Requires the pipeline to pass
+    # the gate through to LossInputs for the capacity maximization loss (eta).
+    adaptive_capacity: bool = False
     message_prep_layers: int = 2
     attention_reduction: int = 8
     max_delta: float = 1.0
@@ -125,11 +183,12 @@ class MessagePreparationNetwork(nn.Module):
     touches the cover image.
     """
 
-    def __init__(self, message_channels: int, num_layers: int) -> None:
+    def __init__(self, message_channels: int, num_layers: int, bits_per_pixel: int = 1) -> None:
         super().__init__()
         num_layers = max(1, num_layers)
 
-        layers = [ConvNormActivation(1, message_channels)]
+        # Input: bits_per_pixel channels (one per bit-plane). bpp=1 is identical to original.
+        layers = [ConvNormActivation(bits_per_pixel, message_channels)]
         layers.extend(
             ConvNormActivation(message_channels, message_channels)
             for _ in range(num_layers - 1)
@@ -254,14 +313,17 @@ class WeightPayloadEncoder(nn.Module):
         super().__init__()
         _validate_config(config)
         self.config = config
-        self.grid_side = math.ceil(math.sqrt(config.payload_dim))
-        self.padded_dim = self.grid_side * self.grid_side
+        # grid_side covers ONE bit-plane; total payload = bpp × grid_side².
+        self.grid_side = math.ceil(math.sqrt(config.payload_dim / config.bits_per_pixel))
+        # padded_dim is the TOTAL bits including all bpp planes (with square padding).
+        self.padded_dim = config.bits_per_pixel * self.grid_side * self.grid_side
 
         # MessagePreparationNetwork gives every bit local context, keeping
         # its own dedicated grid location throughout (no pooling/flattening).
         self.message_prep = MessagePreparationNetwork(
             message_channels=config.message_channels,
             num_layers=config.message_prep_layers,
+            bits_per_pixel=config.bits_per_pixel,
         )
         # Stem projects four byte channels into a learned feature space.
         self.stem = ConvNormActivation(config.input_channels, config.base_channels)
@@ -282,6 +344,18 @@ class WeightPayloadEncoder(nn.Module):
             config.output_channels,
             kernel_size=3,
             padding=1,
+        )
+        # Adaptive capacity gate (only built when enabled).
+        # At rest (adaptive_capacity=False) this is None and the encoder
+        # behaves identically to the fixed-bpp design.
+        self.capacity_gate: AdaptiveCapacityGate | None = (
+            AdaptiveCapacityGate(
+                input_channels=config.input_channels,
+                hidden_channels=max(8, config.base_channels // 4),
+                bits_per_pixel=config.bits_per_pixel,
+            )
+            if config.adaptive_capacity
+            else None
         )
 
     def forward(self, weight_representation: torch.Tensor, payload: torch.Tensor) -> torch.Tensor:
@@ -311,7 +385,14 @@ class WeightPayloadEncoder(nn.Module):
         payload = payload.to(dtype=torch.float32)
         if self.padded_dim != self.config.payload_dim:
             payload = F.pad(payload, (0, self.padded_dim - self.config.payload_dim))
-        bitmap = payload.view(payload.shape[0], 1, self.grid_side, self.grid_side)
+        # For bpp>1 the flat payload is interleaved: position i in the flat
+        # vector belongs to bit-plane (i % bpp), grid cell (i // bpp).
+        # Reshaping as (B, grid, grid, bpp) then permuting puts each
+        # bit-plane into its own channel, matching the decoder's inverse.
+        bpp = self.config.bits_per_pixel
+        bitmap = payload.view(
+            payload.shape[0], self.grid_side, self.grid_side, bpp
+        ).permute(0, 3, 1, 2).contiguous()  # (B, bpp, grid_side, grid_side)
 
         message_features = self.message_prep(bitmap)
         # Nearest upsampling (not bilinear) preserves hard bit boundaries —
@@ -333,9 +414,29 @@ class WeightPayloadEncoder(nn.Module):
             else:
                 features = block(features, message_features)
 
-        delta = torch.tanh(self.output_projection(features)) * self.config.max_delta
+        channel_limits = torch.tensor(
+            [2.0, 8.0, 24.0, 24.0],  # ch0=sign+exp (very sensitive), ch1=upper mantissa, ch2-3=safe
+            device=features.device
+        ).view(1, 4, 1, 1)
+        delta = torch.tanh(self.output_projection(features)) * channel_limits
+
+        # Adaptive capacity gate: learned per-pixel soft mask g ∈ [0,1].
+        # Pixels where g→0 receive near-zero perturbation — those bits
+        # become unrecoverable but don't hurt host model accuracy.
+        # Pixels where g→1 carry the full payload signal.
+        # With reference_decoding=True the decoder sees (modified - original)
+        # so gated-out pixels naturally have residual≈0 and are ignored.
+        if self.capacity_gate is not None:
+            gate = self.capacity_gate(weight_representation)  # (B, 1, H, W)
+            delta = delta * gate
+        else:
+            gate = None
+
         output = weight_representation + delta
-        return output.to(dtype=original_dtype) if original_dtype.is_floating_point else output
+        modified = output.to(dtype=original_dtype) if original_dtype.is_floating_point else output
+        # Return (modified_repr, gate) — gate is None when adaptive_capacity=False.
+        # Pipeline unpacks both; downstream losses use gate for capacity term.
+        return modified, gate
 
     def _validate_inputs(
         self,

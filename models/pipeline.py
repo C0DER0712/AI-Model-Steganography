@@ -275,6 +275,16 @@ class EmbeddingPipeline(nn.Module):
         # needs to learn sign-of-pooled-residual per bit, not untangle the
         # encoder's perturbation FROM the host model's natural weight pattern.
         # See PipelineConfig.reference_decoding for the full rationale.
+
+
+        # If encoder returns a tuple (modified_repr, gate) or similar:
+        if isinstance(modified_repr_batch, tuple):
+            modified_repr_batch, capacity_gate = modified_repr_batch
+        else:
+            capacity_gate = None
+        
+        decoder_input = modified_repr_batch - original_repr_batch
+
         if self.config.reference_decoding:
             decoder_input = modified_repr_batch - original_repr_batch
         else:
@@ -332,6 +342,7 @@ class EmbeddingPipeline(nn.Module):
             original_weights=original_repr_batch.detach(),
             detector_logits=detector_logits,
             detector_targets=detector_targets,
+            capacity_gate=capacity_gate,
         )
 
     def encode(

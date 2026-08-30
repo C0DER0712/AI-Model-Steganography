@@ -19,12 +19,21 @@ class LossWeights:
         payload: Beta coefficient for payload reconstruction loss.
         distortion: Gamma coefficient for weight-representation distortion loss.
         detector: Delta coefficient for frozen-detector loss.
+        capacity: Eta coefficient for adaptive capacity maximisation loss.
+            When > 0 and encoder.adaptive_capacity=True, the training loss
+            includes -eta * mean(gate) which pushes the learned gate toward
+            1 (use more pixels) unless the classification or payload gradient
+            pushes it toward 0 (skip sensitive pixels). The interplay of
+            these three forces causes the encoder to discover the Pareto-
+            optimal set of weight pixels to embed bits in, without any
+            hand-coded bpp assignment.
     """
 
     classification: float = 0.5
     payload: float = 10.0
     distortion: float = 200.0
     detector: float = 2.0
+    capacity: float = 0.0
 
 
 @dataclass(frozen=True)
@@ -50,6 +59,9 @@ class LossInputs:
     original_weights: torch.Tensor | None = None
     detector_logits: torch.Tensor | None = None
     detector_targets: torch.Tensor | None = None
+    # Learned per-pixel gate from AdaptiveCapacityGate; None for fixed-bpp.
+    # Shape (batch, 1, H, W), values in [0,1].
+    capacity_gate: torch.Tensor | None = None
 
 
 @dataclass(frozen=True)
@@ -134,6 +146,22 @@ class CompositeLoss(nn.Module):
         self.distortion_loss = distortion_loss or WeightDistortionLoss()
         self.detector_loss = detector_loss or DetectorLoss()
 
+    def set_alpha(self, alpha: float) -> None:
+        """Update the classification loss weight (alpha) in-place.
+
+        Called each epoch by AlphaCurriculumScheduler during the warm-up
+        phase to linearly ramp alpha from 0 → target while keeping all other
+        loss weights unchanged.  The pipeline's run_classification flag is
+        NOT changed here — that is set once at pipeline build time based on
+        the *final* target alpha (> 0), so classification forward passes
+        always run during warmup even though their gradient contribution is
+        scaled to 0 for the first few epochs.  This is intentional: it keeps
+        the pipeline graph identical throughout training, avoiding any state
+        discontinuity on resume.
+        """
+        import dataclasses
+        self.weights = dataclasses.replace(self.weights, classification=float(alpha))
+
     def forward(self, inputs: LossInputs) -> LossOutput:
         """Compute weighted composite loss and named components.
 
@@ -156,11 +184,14 @@ class CompositeLoss(nn.Module):
         distortion = self._maybe_distortion_loss(inputs)
         detector = self._maybe_detector_loss(inputs)
 
+        capacity = self._maybe_capacity_loss(inputs)
+
         weighted_terms = {
             "classification": (classification, self.weights.classification),
             "payload": (payload, self.weights.payload),
             "distortion": (distortion, self.weights.distortion),
             "detector": (detector, self.weights.detector),
+            "capacity": (capacity, self.weights.capacity),
         }
 
         for name, (loss, weight) in weighted_terms.items():
@@ -196,6 +227,32 @@ class CompositeLoss(nn.Module):
         if inputs.modified_weights is None or inputs.original_weights is None:
             raise ValueError("distortion loss requires modified and original weights.")
         return self.distortion_loss(inputs.modified_weights, inputs.original_weights)
+
+    def _maybe_capacity_loss(self, inputs: LossInputs) -> torch.Tensor | None:
+        """Adaptive capacity maximisation: penalise unused pixels.
+
+        When the encoder's AdaptiveCapacityGate is active, ``capacity_gate``
+        is a (B, 1, H, W) soft mask in [0,1].  We want to MAXIMISE the
+        mean gate (use as many pixels as possible), so the loss term is
+        ``-mean(gate)``.  The negative sign means minimising this loss is
+        equivalent to maximising gate usage.
+
+        The interplay with other losses gives genuine adaptive capacity:
+        - Capacity loss pushes gate → 1 (use all pixels).
+        - Classification loss gradient pushes delta → 0 for sensitive pixels,
+          which forces gate → 0 there (or the accuracy drops).
+        - Payload loss is unchanged (gate-independent; gated-out positions
+          still contribute BCE, incentivising the gate to only zero out
+          positions where the payload gradient is low anyway).
+        Together these three forces discover the Pareto-optimal set of
+        pixels to embed bits in — no hand-coded bpp required.
+        """
+        if self.weights.capacity == 0:
+            return None
+        if inputs.capacity_gate is None:
+            return None  # encoder.adaptive_capacity=False, skip silently
+        # -mean(gate): minimising this maximises gate usage.
+        return -inputs.capacity_gate.mean()
 
     def _maybe_detector_loss(self, inputs: LossInputs) -> torch.Tensor | None:
         if self.weights.detector == 0:

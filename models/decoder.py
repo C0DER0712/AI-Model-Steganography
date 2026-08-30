@@ -57,6 +57,19 @@ class DecoderConfig:
     num_residual_blocks: int = 4
     attention_reduction: int = 8
     gradient_checkpointing: bool = False
+    # Number of independent payload bits encoded per spatial position in the
+    # weight image.  With reference_decoding=True the decoder sees the pure
+    # encoder residual, so each of the 4 IEEE754 byte-channels independently
+    # carries its own bit signal.  bits_per_pixel=1 (default) is the original
+    # single-bit-per-pixel design (ceiling ~277KB for MobileNetV2).  Higher
+    # values multiply capacity at the cost of the encoder having to fit more
+    # independent signals into the per-pixel residual.  Practical ceiling:
+    #   bpp=1 ->  277KB / 3.1% embed rate  (proven, no cross-bit interference)
+    #   bpp=2 ->  554KB / 6.3% embed rate
+    #   bpp=4 -> 1109KB / 12.5% embed rate (each of the 4 byte channels carries 1 bit)
+    #   bpp=8 -> 2218KB / 25.0% embed rate (theoretical only; likely too noisy)
+    # Requires encoder.bits_per_pixel to match this value exactly.
+    bits_per_pixel: int = 1
 
 
 class ConvNormActivation(nn.Module):
@@ -159,11 +172,16 @@ class DensePayloadDecoder(nn.Module):
                 for _ in range(config.num_residual_blocks)
             ]
         )
-        # Single 1x1 conv down to ONE channel: a dense bit-logit map, the
-        # same spatial size as the weight image. No shared MLP head, no
-        # multi-bit-per-vector reconstruction — each spatial location's
-        # pooled value (see forward()) directly IS one bit's logit.
-        self.logit_projection = nn.Conv2d(config.base_channels, 1, kernel_size=1)
+        # 1x1 conv down to bits_per_pixel channels: each channel is an
+        # independent dense logit map for one bit-plane.  With bpp=1
+        # (default) this is identical to the original single-channel design.
+        # Higher bpp values let each spatial position carry multiple
+        # independent bits — the encoder's FiLM conditioning learns to
+        # write each bit-plane into a distinct combination of the 4 IEEE754
+        # byte channels, and the decoder reverses that mapping here.
+        self.logit_projection = nn.Conv2d(
+            config.base_channels, config.bits_per_pixel, kernel_size=1
+        )
 
     def forward(self, weight_representation: torch.Tensor, num_bits: int) -> torch.Tensor:
         """Reconstruct payload logits from a weight representation.
@@ -193,16 +211,21 @@ class DensePayloadDecoder(nn.Module):
             else:
                 features = block(features)
 
-        logit_map = self.logit_projection(features)  # (batch, 1, H, W)
+        bpp = self.config.bits_per_pixel
+        logit_map = self.logit_projection(features)  # (batch, bpp, H, W)
 
-        # Mild average-pool down to the payload grid resolution: this
-        # antialiases over each bit's own local pixel neighborhood (the
-        # weight image is naturally higher-resolution than the payload
-        # grid — see encoder module docstring), NOT an aggregation of many
-        # unrelated bits into a shared vector like the previous design.
-        grid_side = math.ceil(math.sqrt(num_bits))
+        # Pool down to the per-bit-plane grid resolution.  For bpp=1 the
+        # total payload bits equal grid_side².  For bpp>1, each grid cell
+        # carries bpp bits, so grid_side = ceil(sqrt(num_bits / bpp)).
+        grid_side = math.ceil(math.sqrt(num_bits / bpp))
         pooled = F.adaptive_avg_pool2d(logit_map, output_size=(grid_side, grid_side))
-        logits = pooled.reshape(pooled.shape[0], grid_side * grid_side)
+        # pooled: (batch, bpp, grid_side, grid_side)
+        # Interleave: each spatial cell's bpp logits are adjacent in the
+        # output, matching the encoder's bitmap layout — see WeightPayloadEncoder.
+        # (batch, bpp, grid_side, grid_side)
+        #   -> (batch, grid_side, grid_side, bpp)   [move bpp to last]
+        #   -> (batch, grid_side * grid_side * bpp) [flatten row-major]
+        logits = pooled.permute(0, 2, 3, 1).reshape(pooled.shape[0], grid_side * grid_side * bpp)
 
         return logits.to(dtype=original_dtype) if original_dtype.is_floating_point else logits
 

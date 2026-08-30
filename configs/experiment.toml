@@ -28,7 +28,9 @@ python_version = "3.11"
 # Must be one of: "128KB", "256KB", "512KB", "1MB".
 # Start smaller (32KB not in the supported set, so use 128KB) while getting
 # a config running on a small GPU, then scale up once training is stable.
-payload_size = "128KB"
+payload_size = "256KB"  # 256KB = 2,097,152 bits. grid_side=1449 < image_side=1507
+# for MobileNetV2 (10 classes), so all bits embed uniquely — the geometric
+# ceiling before the encoder must downsample the payload grid and drop bits.
 
 # Number of synthetic training samples when no real dataset is provided.
 synthetic_samples = 512
@@ -127,19 +129,43 @@ message_channels     = 32
 # space, layer 2 lets each location incorporate its immediate neighbors'
 # values before upsampling to the weight image's resolution.
 message_prep_layers  = 2
+# Multi-bit embedding: how many independent payload bits each weight pixel
+# carries. 1 = original single-bit design. With reference_decoding=True the
+# 4 IEEE754 byte-channels of the residual can carry up to 4 independent bit
+# signals — bits_per_pixel=4 gives ~12.5% embedding rate vs 3.1% for bpp=1.
+# Start with bpp=2 for the first multi-bit experiment (lower risk of OOM and
+# cross-bit interference than bpp=4) then move to 4 once it validates.
+# Must equal [decoder] bits_per_pixel exactly.
+bits_per_pixel       = 4
+# Adaptive capacity: the encoder learns WHICH pixels are safe to embed
+# bits in, rather than uniformly embedding bpp bits everywhere. The gate
+# g ∈ [0,1] per pixel is driven by capacity loss (eta → use more pixels),
+# classification loss (alpha → protect sensitive pixels), and payload loss.
+# The model discovers spatially non-uniform capacity — genuinely adaptive.
+adaptive_capacity    = true
 attention_reduction  = 8
 # Bound on the encoder's per-pixel residual (0-255 scale). Kept generous
 # (24) since gamma (distortion loss weight) is 0 during this payload-only
 # phase — nothing currently penalizes distortion, so there's no reason to
 # starve the payload signal. Pull this back down once gamma is
 # reintroduced for the full 4-objective run and stealth actually matters.
-max_delta            = 24.0
+max_delta            = 4.0
+# Large delta for Phase 1 (curriculum warmup). With reference_decoding,
+# even small deltas give perfect payload recovery — but a larger delta
+# gives the encoder more room to write the signal cleanly before the
+# accuracy constraint kicks in. The classification gradient naturally
+# reduces effective perturbation size during and after warmup. — with reference_decoding the decoder
+# sees the pure residual with zero noise, so even small deltas give near-
+# perfect payload recovery. Smaller delta = smaller weight perturbation =
+# less classification accuracy drop. Raise if payload BER climbs too high.
 
 # ---------------------------------------------------------------------------
 # Decoder architecture
 # ---------------------------------------------------------------------------
 
 [decoder]
+# bits_per_pixel must match [encoder] bits_per_pixel exactly.
+bits_per_pixel     = 4
 # Architecture v2 (dense/fully-convolutional, see models/decoder.py module
 # docstring): no chunk_size, no shared per-chunk MLP head, no chunk
 # position encoding, no region_pool_size — the decoder is a plain conv
@@ -177,10 +203,21 @@ dropout              = 0.5
 # ---------------------------------------------------------------------------
 
 [loss_weights]
-alpha = 1.0   # Host model accuracy preservation
+# Phase 2: payload + classification. Teaches the encoder to carry bits
+# while preserving MobileNetV2 accuracy on CIFAR-10.
+# gamma (distortion) and delta (detector) intentionally kept at 0 for now —
+# add them in a third phase once payload+classification are stable.
+# Run with --dataset cifar10 (synthetic data has random labels -> classification
+# loss is meaningless on synthetic images).
+alpha = 1.0   # Host model accuracy preservation (requires --dataset cifar10)
 beta  = 1.0   # Payload recovery
-gamma = 1.0   # Weight-representation distortion (stealth)
-delta = 1.0   # Frozen detector evasion
+gamma = 0.0   # Weight-representation distortion (add later)
+delta = 0.0   # Frozen detector evasion (add later)
+# Capacity maximisation weight (eta). Pushes learned gate → 1 (use more
+# weight pixels). Alpha pushes it back → 0 for sensitive pixels. Together
+# they find the Pareto-optimal embedding. Raise if gate collapses to 0;
+# lower if model ignores host accuracy.
+eta   = 0.1   # Adaptive capacity maximisation
 
 # ---------------------------------------------------------------------------
 # Training loop
@@ -196,7 +233,11 @@ batch_size            = 16
 # there's no competing objective to destabilize, so it's safe to be
 # aggressive here. Pull this back down once you reintroduce
 # classification/distortion/detector losses.
-learning_rate         = 2.0e-3
+learning_rate         = 1.0e-3
+# Slightly lower than pure payload-only (2e-3) but higher than fixed
+# multi-objective (5e-4): the curriculum warm-up phase (alpha=0) means the
+# first N epochs are effectively single-objective, so we can afford a
+# larger initial LR that the cosine schedule decays smoothly.
 weight_decay          = 1.0e-5
 gradient_clip_norm    = 0.5
 # Was 1.0. Tightened after observing a single-batch instability spike around
@@ -239,6 +280,19 @@ scheduler_gamma       = 0.5     # StepLR / ReduceLROnPlateau decay factor
 
 # Set to null to disable early stopping.
 early_stopping_patience = 50
+# Curriculum: linearly ramp alpha from 0 → target over this many epochs.
+# The encoder first learns to embed the payload aggressively (unconstrained);
+# then as alpha ramps up, the classification gradient forces it to find
+# more subtle embeddings. With reference_decoding=True, even tiny residuals
+# give perfect payload recovery, so the encoder can freely shrink its
+# effective delta magnitude to satisfy the accuracy objective without
+# sacrificing payload BER. 0 = no curriculum (alpha fixed from epoch 1).
+alpha_warmup_epochs   = 300
+
+# Curriculum: alpha linearly ramps 0 -> 1.0 over the first N epochs.
+# Phase 1 (epochs 1..N): embed aggressively, no accuracy pressure.
+# Phase 2 (epochs N+1..max_epochs): full multi-objective.
+# Set to 0 to disable warmup (use fixed alpha from epoch 1).
 # Was 10. Seen empirically: a single hard/outlier batch (461-sample synthetic
 # dataset, ~29 steps/epoch, fresh random 1,048,576-bit payload every step —
 # very little epoch-to-epoch averaging to smooth out one bad batch) can spike

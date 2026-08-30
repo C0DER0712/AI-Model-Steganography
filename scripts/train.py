@@ -1,3 +1,4 @@
+#!/usr/bin/env python3
 """Training entry point for the steganographic embedding pipeline.
 
 Usage
@@ -276,6 +277,12 @@ def main(argv: list[str] | None = None) -> int:
     # per-chunk MLP head. Payload is reshaped into a square bitmap and
     # processed/decoded with full spatial correspondence throughout — see
     # models/encoder.py and models/decoder.py module docstrings for why.
+    # bits_per_pixel: how many independent payload bits each weight pixel
+    # carries.  1 = original design (ceiling ~277KB for MobileNetV2).
+    # Higher values multiply capacity: bpp=4 -> ~1.1MB / 12.5% embed rate.
+    # Must be identical in encoder and decoder configs.
+    bits_per_pixel = enc_sec.get("bits_per_pixel", dec_sec.get("bits_per_pixel", 1))
+
     encoder_cfg = EncoderConfig(
         payload_dim=payload_bits,
         base_channels=enc_sec.get("base_channels", 64),
@@ -285,12 +292,15 @@ def main(argv: list[str] | None = None) -> int:
         attention_reduction=enc_sec.get("attention_reduction", 8),
         max_delta=enc_sec.get("max_delta", 1.0),
         gradient_checkpointing=enc_sec.get("gradient_checkpointing", False),
+        bits_per_pixel=bits_per_pixel,
+        adaptive_capacity=enc_sec.get("adaptive_capacity", False),
     )
     decoder_cfg = DecoderConfig(
         base_channels=dec_sec.get("base_channels", 64),
         num_residual_blocks=dec_sec.get("num_residual_blocks", 4),
         attention_reduction=dec_sec.get("attention_reduction", 8),
         gradient_checkpointing=dec_sec.get("gradient_checkpointing", False),
+        bits_per_pixel=bits_per_pixel,
     )
 
     # ---- Build pipeline config ----
@@ -344,6 +354,11 @@ def main(argv: list[str] | None = None) -> int:
         mixed_precision=_resolve(None, train_sec.get("mixed_precision"), args.mixed_precision),
         early_stopping_patience=_resolve(
             args.patience, train_sec.get("early_stopping_patience"), None
+        ),
+        # Curriculum: alpha ramps 0 → target over first N epochs.
+        # See ExperimentConfig.alpha_warmup_epochs for the rationale.
+        alpha_warmup_epochs=_resolve(
+            None, train_sec.get("alpha_warmup_epochs"), 0
         ),
         scheduler=_resolve(args.scheduler, train_sec.get("scheduler"), "cosine"),
         scheduler_t_max=_resolve(None, train_sec.get("scheduler_t_max"), max_epochs),

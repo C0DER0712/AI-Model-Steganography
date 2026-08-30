@@ -14,6 +14,7 @@ from __future__ import annotations
 import json
 import logging
 import time
+import dataclasses
 from dataclasses import asdict, dataclass, field
 from pathlib import Path
 from typing import Any, Iterable
@@ -78,6 +79,19 @@ class ExperimentConfig:
     log_every_n_steps: int = 10
     save_best_only: bool = False
     num_workers: int = 0
+    # Curriculum learning: number of epochs over which alpha (classification
+    # loss weight) is linearly ramped from 0 up to its configured target value.
+    # 0 = no warmup (alpha is fixed at its configured value from epoch 1).
+    #
+    # WHY: With a large payload and max_delta, the encoder's payload gradient
+    # is strong and fast-converging. Introducing the classification gradient
+    # simultaneously from epoch 1 creates a tug-of-war that slows both
+    # objectives. The warmup lets the encoder first learn WHERE and HOW to
+    # embed bits (unconstrained, strong signal), then gradually introduces
+    # accuracy pressure that forces the encoder to find more efficient,
+    # subtle embeddings — exactly the "embed aggressively first, then learn
+    # stealth" curriculum.
+    alpha_warmup_epochs: int = 0
 
 
 @dataclass(frozen=True)
@@ -152,7 +166,28 @@ class SteganographyExperiment:
 
         # ---- Build pipeline ----
         logger.info("Building pipeline…")
-        pipeline = EmbeddingPipeline(cfg.pipeline)
+        # Skip the detector's and/or classification's forward pass entirely
+        # when their loss weight is 0 (see PipelineConfig.run_classification/
+        # run_detector) — no point paying for a full CNN forward pass over
+        # the whole weight image (the detector) or a functional_call through
+        # the host model (classification) when neither contributes to the
+        # loss. This is derived fresh from cfg.loss_weights on every run, so
+        # switching alpha/delta back on for the full 4-objective run
+        # automatically re-enables both forward passes — nothing to revert
+        # by hand.
+        pipeline_cfg = dataclasses.replace(
+            cfg.pipeline,
+            run_classification=cfg.loss_weights.classification > 0,
+            run_detector=cfg.loss_weights.detector > 0,
+        )
+        logger.info(
+            "Pipeline forward passes: classification=%s (alpha=%s), detector=%s (delta=%s)",
+            pipeline_cfg.run_classification,
+            cfg.loss_weights.classification,
+            pipeline_cfg.run_detector,
+            cfg.loss_weights.detector,
+        )
+        pipeline = EmbeddingPipeline(pipeline_cfg)
         logger.info(
             "Pipeline built: host=%s, encoder params=%d, decoder params=%d",
             cfg.pipeline.host_model_name,
@@ -178,6 +213,19 @@ class SteganographyExperiment:
 
         # ---- Build scheduler ----
         scheduler = _build_scheduler(optimizer, cfg)
+
+        # ---- Wrap scheduler with curriculum (alpha warmup) if configured ----
+        if cfg.alpha_warmup_epochs > 0 and cfg.loss_weights.classification > 0:
+            logger.info(
+                "Alpha curriculum: ramping classification weight 0 → %.4f over %d epochs.",
+                cfg.loss_weights.classification,
+                cfg.alpha_warmup_epochs,
+            )
+            # Start alpha at 0 (the ramp-up starts from epoch 1 in step())
+            loss_fn.set_alpha(0.0)
+            scheduler = AlphaCurriculumScheduler(
+                scheduler, loss_fn, cfg.alpha_warmup_epochs, cfg.loss_weights.classification
+            )
 
         # ---- Build trainer ----
         trainer_config = TrainerConfig(
@@ -338,6 +386,75 @@ class SteganographyExperiment:
             logger.info("Training curves saved to %s", dest)
         except Exception as exc:  # noqa: BLE001
             logger.warning("Could not generate training plots: %s", exc)
+
+
+
+
+# ---------------------------------------------------------------------------
+# Curriculum scheduler
+# ---------------------------------------------------------------------------
+
+
+class AlphaCurriculumScheduler:
+    """Wraps a PyTorch LR scheduler and linearly ramps alpha each epoch.
+
+    The Trainer calls ``scheduler.step()`` (or ``scheduler.step(metrics)``
+    for ReduceLROnPlateau) at the end of every epoch.  This wrapper
+    intercepts those calls to update ``loss_fn.weights.classification``
+    from 0 → ``target_alpha`` linearly over ``warmup_epochs`` epochs,
+    then delegates to the real scheduler for the LR update.
+
+    Checkpoint-safe: ``state_dict`` / ``load_state_dict`` persist the
+    current epoch counter so alpha is restored correctly on resume.
+    """
+
+    def __init__(
+        self,
+        real_scheduler: Any,
+        loss_fn: "CompositeLoss",
+        warmup_epochs: int,
+        target_alpha: float,
+    ) -> None:
+        self._sched = real_scheduler
+        self._loss_fn = loss_fn
+        self._warmup = warmup_epochs
+        self._target = target_alpha
+        self._epoch: int = 0
+
+    def _update_alpha(self) -> None:
+        if self._warmup <= 0:
+            return
+        alpha = min(self._target, self._target * self._epoch / self._warmup)
+        self._loss_fn.set_alpha(alpha)
+        if self._epoch % max(1, self._warmup // 10) == 0 or self._epoch == self._warmup:
+            logger.info(
+                "Curriculum: epoch %d/%d — alpha ramped to %.4f / %.4f",
+                self._epoch, self._warmup, alpha, self._target,
+            )
+
+    def step(self, metrics: float | None = None) -> None:
+        self._epoch += 1
+        self._update_alpha()
+        if metrics is not None:
+            self._sched.step(metrics)
+        else:
+            self._sched.step()
+
+    def state_dict(self) -> dict[str, Any]:
+        return {"epoch": self._epoch, "real": self._sched.state_dict()}
+
+    def load_state_dict(self, state: dict[str, Any]) -> None:
+        self._epoch = state["epoch"]
+        self._sched.load_state_dict(state["real"])
+        # Restore alpha to wherever we were in the curriculum
+        self._update_alpha()
+
+    # Proxy everything else the Trainer might call
+    def get_last_lr(self) -> list[float]:
+        return getattr(self._sched, "get_last_lr", lambda: [])()
+
+    def __getattr__(self, name: str) -> Any:
+        return getattr(self._sched, name)
 
 
 def run_experiment(
