@@ -38,3 +38,6 @@ checkpoints/
 Thumbs.db
 .idea/
 .vscode/
+
+
+zip_to_pt.py
