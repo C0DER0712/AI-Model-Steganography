@@ -64,7 +64,7 @@ num_classes = 1000
 pretrained = false
 
 # Allow the host model to be fine-tuned alongside encoder/decoder.
-train_host_model = false
+train_host_model = true
 
 # ---------------------------------------------------------------------------
 # Encoder architecture
