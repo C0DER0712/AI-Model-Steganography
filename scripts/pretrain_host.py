@@ -31,6 +31,12 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument("--data-root", type=Path, default=Path("data"))
     parser.add_argument(
+        "--download",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="Download CIFAR-10 when it is not already present.",
+    )
+    parser.add_argument(
         "--output", type=Path,
         default=Path("outputs/host_pretraining/mobilenet_v2_cifar10.pt"),
     )
@@ -47,6 +53,11 @@ def _resolve_device(value: str) -> torch.device:
     if value == "auto":
         return torch.device("cuda" if torch.cuda.is_available() else "cpu")
     return torch.device(value)
+
+
+def _cifar_root(path: Path) -> Path:
+    """Return torchvision's root when given its batches directory directly."""
+    return path.parent if path.name == "cifar-10-batches-py" else path
 
 
 @torch.no_grad()
@@ -69,8 +80,9 @@ def main() -> int:
     transform = transforms.Compose([
         transforms.Resize((224, 224)), transforms.ToTensor(), IMAGENET_NORMALIZE,
     ])
-    train_ds = CIFAR10(str(args.data_root), train=True, download=True, transform=transform)
-    test_ds = CIFAR10(str(args.data_root), train=False, download=True, transform=transform)
+    data_root = _cifar_root(args.data_root)
+    train_ds = CIFAR10(str(data_root), train=True, download=args.download, transform=transform)
+    test_ds = CIFAR10(str(data_root), train=False, download=args.download, transform=transform)
     train_loader = DataLoader(
         train_ds, batch_size=args.batch_size, shuffle=True,
         num_workers=args.num_workers, pin_memory=device.type == "cuda",

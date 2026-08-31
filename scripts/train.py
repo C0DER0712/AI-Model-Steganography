@@ -82,6 +82,11 @@ def _resolve(cli_val: T | None, toml_val: Any, default: T) -> T:
     return default
 
 
+def _cifar_root(path: Path) -> Path:
+    """Return torchvision's root when given its batches directory directly."""
+    return path.parent if path.name == "cifar-10-batches-py" else path
+
+
 def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser = argparse.ArgumentParser(
         description="Train the steganographic embedding pipeline.",
@@ -111,6 +116,12 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         default=Path("./data"),
         help="Directory to download/cache CIFAR-10 into. Ignored for "
              "'synthetic'. (default: ./data)",
+    )
+    parser.add_argument(
+        "--download-dataset",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="Download CIFAR-10 when it is not already present.",
     )
 
     # Pipeline — default=None so we can detect explicit CLI supply
@@ -396,11 +407,12 @@ def main(argv: list[str] | None = None) -> int:
             ))
         transform = transforms.Compose(tfms)
 
+        data_root = _cifar_root(args.data_root)
         cifar_train_full = CIFAR10(
-            root=str(args.data_root), train=True, download=True, transform=transform
+            root=str(data_root), train=True, download=args.download_dataset, transform=transform
         )
         cifar_test = CIFAR10(
-            root=str(args.data_root), train=False, download=True, transform=transform
+            root=str(data_root), train=False, download=args.download_dataset, transform=transform
         )
 
         # An explicit opt-in cap is useful for smoke tests.  Do not reuse
