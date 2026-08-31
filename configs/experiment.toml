@@ -57,11 +57,12 @@ num_workers = 0
 #   vgg16         11763x11763 -- not feasible on a single consumer GPU as-is
 name = "mobilenet_v2"
 
-# Number of classification output classes (1000 = ImageNet).
-num_classes = 1000
+# CIFAR-10 has ten output classes. The ImageNet-pretrained feature extractor
+# is retained while its final classifier is replaced for this task.
+num_classes = 10
 
 # Load official pretrained ImageNet weights.
-pretrained = false
+pretrained = true
 
 # Allow the host model to be fine-tuned alongside encoder/decoder.
 train_host_model = true

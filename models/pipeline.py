@@ -371,6 +371,8 @@ class EmbeddingPipeline(nn.Module):
             original_repr = torch.from_numpy(channels_uint8.astype(np.float32)).to(device)
             original_repr_batch = original_repr.unsqueeze(0)
             modified_repr = self.encoder(original_repr_batch, payload_bits)
+            if isinstance(modified_repr, tuple):
+                modified_repr, _ = modified_repr
         return modified_repr, original_repr_batch
 
     def decode(

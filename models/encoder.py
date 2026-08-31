@@ -358,7 +358,9 @@ class WeightPayloadEncoder(nn.Module):
             else None
         )
 
-    def forward(self, weight_representation: torch.Tensor, payload: torch.Tensor) -> torch.Tensor:
+    def forward(
+        self, weight_representation: torch.Tensor, payload: torch.Tensor
+    ) -> tuple[torch.Tensor, torch.Tensor | None]:
         """Produce a modified weight representation.
 
         Args:
@@ -366,8 +368,8 @@ class WeightPayloadEncoder(nn.Module):
             payload: Tensor with shape `(batch, payload_dim)`.
 
         Returns:
-            Tensor with the same spatial shape as `weight_representation` and
-            `config.output_channels` channels.
+            A tuple of the modified representation and the optional adaptive
+            capacity gate.
 
         Raises:
             ValueError: If input shapes do not match the encoder configuration.
@@ -414,8 +416,12 @@ class WeightPayloadEncoder(nn.Module):
             else:
                 features = block(features, message_features)
 
-        channel_limits = torch.tensor(
-            [24.0, 24.0, 0.0, 0.0], device=features.device, dtype=torch.float32
+        # p0 and p1 contain the IEEE-754 sign and exponent bits. Altering
+        # either can create infinities/NaNs or change a weight's magnitude by
+        # orders of magnitude. Restrict embedding to the two mantissa-only
+        # byte planes, where max_delta bounds the perturbation safely.
+        channel_limits = features.new_tensor(
+            [0.0, 0.0, self.config.max_delta, self.config.max_delta]
         ).view(1, 4, 1, 1)
         delta = torch.tanh(self.output_projection(features)) * channel_limits
 

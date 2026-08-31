@@ -115,6 +115,22 @@ def test_composite_loss_skips_zero_weight_terms() -> None:
     assert set(output.components) == {"payload"}
 
 
+def test_composite_loss_does_not_evaluate_zero_weight_classification() -> None:
+    inputs = LossInputs(
+        classification_logits=torch.full((2, 2), float("nan")),
+        classification_targets=torch.tensor([0, 1]),
+        payload_logits=torch.tensor([[2.0, -1.0]]),
+        payload_targets=torch.tensor([[1, 0]], dtype=torch.uint8),
+    )
+
+    output = CompositeLoss(
+        LossWeights(classification=0.0, payload=1.0, distortion=0.0, detector=0.0)
+    )(inputs)
+
+    assert torch.isfinite(output.total)
+    assert set(output.components) == {"payload"}
+
+
 def test_composite_loss_requires_inputs_for_enabled_terms() -> None:
     composite = CompositeLoss(
         LossWeights(classification=1.0, payload=0.0, distortion=0.0, detector=0.0)

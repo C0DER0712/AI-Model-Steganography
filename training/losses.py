@@ -209,8 +209,10 @@ class CompositeLoss(nn.Module):
         return LossOutput(total=total, components=components)
 
     def _maybe_classification_loss(self, inputs: LossInputs) -> torch.Tensor | None:
-        if inputs.classification_logits is None or inputs.classification_targets is None:
+        if self.weights.classification == 0:
             return None
+        if inputs.classification_logits is None or inputs.classification_targets is None:
+            raise ValueError("classification loss requires logits and targets.")
         loss = self.classification_loss(inputs.classification_logits, inputs.classification_targets)
         # Store accuracy as a side-channel metric (no gradient needed)
         with torch.no_grad():

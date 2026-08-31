@@ -17,11 +17,13 @@ def test_encoder_returns_modified_representation_with_configured_shape() -> None
     weights = torch.rand(2, 4, 8, 8)
     payload = torch.randint(0, 2, (2, 16), dtype=torch.uint8)
 
-    output = encoder(weights, payload)
+    output, gate = encoder(weights, payload)
 
     assert output.shape == weights.shape
     assert output.dtype == weights.dtype
+    assert gate is None
     assert torch.max(torch.abs(output - weights)) <= config.max_delta + 1e-6
+    assert torch.equal(output[:, :2], weights[:, :2])
 
 
 def test_encoder_is_differentiable() -> None:
@@ -37,7 +39,8 @@ def test_encoder_is_differentiable() -> None:
     weights = torch.rand(1, 4, 4, 4, requires_grad=True)
     payload = torch.randint(0, 2, (1, 8), dtype=torch.float32)
 
-    loss = encoder(weights, payload).mean()
+    output, _ = encoder(weights, payload)
+    loss = output.mean()
     loss.backward()
 
     assert weights.grad is not None
