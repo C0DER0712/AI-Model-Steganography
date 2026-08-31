@@ -24,6 +24,11 @@ python_version = "3.11"
 # ---------------------------------------------------------------------------
 
 [data]
+# This configuration is for the real CIFAR-10 host task, not synthetic
+# smoke-test images and labels.
+dataset = "cifar10"
+# ImageNet-pretrained MobileNetV2 is fine-tuned and evaluated at this size.
+image_size = 224
 # Payload size embedded into each host model.
 # Must be one of: "128KB", "256KB", "512KB", "1MB".
 # Start smaller (32KB not in the supported set, so use 128KB) while getting
@@ -64,8 +69,11 @@ num_classes = 10
 # Load official pretrained ImageNet weights.
 pretrained = true
 
+# Create this with scripts/pretrain_host.py before the embedding run.
+checkpoint = "outputs/host_pretraining/mobilenet_v2_cifar10.pt"
+
 # Allow the host model to be fine-tuned alongside encoder/decoder.
-train_host_model = true
+train_host_model = false
 
 # ---------------------------------------------------------------------------
 # Encoder architecture

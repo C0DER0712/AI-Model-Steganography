@@ -27,6 +27,7 @@ from __future__ import annotations
 
 import math
 from dataclasses import dataclass
+from pathlib import Path
 from typing import Any
 
 import numpy as np
@@ -74,6 +75,7 @@ class PipelineConfig:
     host_model_name: HostModelName = "resnet18"
     host_model_num_classes: int = 1000
     host_model_pretrained: bool = False
+    host_model_checkpoint: str | None = None
     train_host_model: bool = False
     encoder: EncoderConfig = None          # type: ignore[assignment]
     decoder: DecoderConfig = None          # type: ignore[assignment]
@@ -174,6 +176,8 @@ class EmbeddingPipeline(nn.Module):
             num_classes=cfg.host_model_num_classes,
             pretrained=cfg.host_model_pretrained,
         )
+        if cfg.host_model_checkpoint is not None:
+            self._load_host_checkpoint(cfg.host_model_checkpoint)
         self.encoder: WeightPayloadEncoder = build_encoder(cfg.encoder)
         self.decoder: DensePayloadDecoder = build_decoder(cfg.decoder)
         self.detector: DifferentiableDetector = DifferentiableDetector(cfg.detector)
@@ -206,6 +210,17 @@ class EmbeddingPipeline(nn.Module):
             # moves this cached image along with the rest of the module,
             # without it being treated as a learnable parameter.
             self.register_buffer("_cached_original_repr_buf", cached_repr, persistent=False)
+
+    def _load_host_checkpoint(self, checkpoint_path: str) -> None:
+        """Load a converged task-model checkpoint before payload embedding."""
+        path = Path(checkpoint_path).expanduser().resolve()
+        if not path.is_file():
+            raise FileNotFoundError(f"Host-model checkpoint not found: {path}")
+        checkpoint = torch.load(path, map_location="cpu", weights_only=True)
+        state_dict = checkpoint.get("model", checkpoint) if isinstance(checkpoint, dict) else checkpoint
+        if not isinstance(state_dict, dict):
+            raise ValueError("Host-model checkpoint must contain a state dictionary.")
+        self.host_model.load_state_dict(state_dict, strict=True)
 
     def forward(
         self,

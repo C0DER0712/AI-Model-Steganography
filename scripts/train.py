@@ -133,6 +133,12 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         help="Allow the host model weights to be fine-tuned. (default: False)",
     )
     parser.add_argument(
+        "--host-checkpoint",
+        type=Path,
+        default=None,
+        help="Path to a separately fine-tuned host-model checkpoint.",
+    )
+    parser.add_argument(
         "--payload-size",
         choices=["128KB", "256KB", "512KB", "1MB"],
         default=None,
@@ -305,10 +311,12 @@ def main(argv: list[str] | None = None) -> int:
 
     # ---- Build pipeline config ----
     pipeline_sec = file_cfg.get("pipeline", {})
+    host_checkpoint = _resolve(args.host_checkpoint, host_sec.get("checkpoint"), None)
     pipeline_cfg = PipelineConfig(
         host_model_name=_resolve(args.host_model, host_sec.get("name"), "resnet18"),
         host_model_num_classes=_resolve(args.num_classes, host_sec.get("num_classes"), default_num_classes),
         host_model_pretrained=_resolve(args.pretrained, host_sec.get("pretrained"), False),
+        host_model_checkpoint=str(host_checkpoint) if host_checkpoint is not None else None,
         train_host_model=_resolve(args.train_host_model, host_sec.get("train_host_model"), False),
         payload_bits=payload_bits,
         payload_replicas=_resolve(args.payload_replicas, train_sec.get("payload_replicas"), 1),
@@ -372,15 +380,20 @@ def main(argv: list[str] | None = None) -> int:
 
     # ---- Build image datasets ----
     val_split = _resolve(args.val_split, data_sec.get("val_split"), 0.1)
-    image_size = _resolve(args.image_size, None, 32)
+    image_size = _resolve(args.image_size, data_sec.get("image_size"), 32)
 
     if dataset_choice == "cifar10":
         # Real CIFAR-10 images/labels, wrapped with a fresh random payload
         # per sample via SteganographyDataset.  Downloads to --data-root on
         # first run (~170MB) and is cached for subsequent runs.
-        tfms = [transforms.ToTensor()]
+        tfms = []
         if image_size != 32:
-            tfms.insert(0, transforms.Resize((image_size, image_size)))
+            tfms.append(transforms.Resize((image_size, image_size)))
+        tfms.append(transforms.ToTensor())
+        if pipeline_cfg.host_model_pretrained:
+            tfms.append(transforms.Normalize(
+                mean=(0.485, 0.456, 0.406), std=(0.229, 0.224, 0.225)
+            ))
         transform = transforms.Compose(tfms)
 
         cifar_train_full = CIFAR10(
@@ -390,9 +403,9 @@ def main(argv: list[str] | None = None) -> int:
             root=str(args.data_root), train=False, download=True, transform=transform
         )
 
-        # Optionally cap CIFAR-10's 50k training images with --synthetic-samples
-        # (reused as a generic "num samples" cap here for quick smoke tests).
-        cap = _resolve(args.synthetic_samples, data_sec.get("synthetic_samples"), None)
+        # An explicit opt-in cap is useful for smoke tests.  Do not reuse
+        # ``synthetic_samples`` here: real CIFAR-10 training needs the full set.
+        cap = data_sec.get("max_train_samples")
         if cap is not None and cap < len(cifar_train_full):
             cifar_train_full = torch.utils.data.Subset(cifar_train_full, range(cap))
 
