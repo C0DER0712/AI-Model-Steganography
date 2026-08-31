@@ -145,6 +145,7 @@ class CompositeLoss(nn.Module):
         self.payload_loss = payload_loss or PayloadReconstructionLoss()
         self.distortion_loss = distortion_loss or WeightDistortionLoss()
         self.detector_loss = detector_loss or DetectorLoss()
+        self._last_host_accuracy = 0.0
 
     def set_alpha(self, alpha: float) -> None:
         """Update the classification loss weight (alpha) in-place.
@@ -208,11 +209,16 @@ class CompositeLoss(nn.Module):
         return LossOutput(total=total, components=components)
 
     def _maybe_classification_loss(self, inputs: LossInputs) -> torch.Tensor | None:
-        if self.weights.classification == 0:
-            return None
         if inputs.classification_logits is None or inputs.classification_targets is None:
-            raise ValueError("classification loss requires logits and targets.")
-        return self.classification_loss(inputs.classification_logits, inputs.classification_targets)
+            return None
+        loss = self.classification_loss(inputs.classification_logits, inputs.classification_targets)
+        # Store accuracy as a side-channel metric (no gradient needed)
+        with torch.no_grad():
+            preds = inputs.classification_logits.argmax(dim=-1)
+            self._last_host_accuracy = (
+                (preds == inputs.classification_targets).float().mean().item()
+            )
+        return loss
 
     def _maybe_payload_loss(self, inputs: LossInputs) -> torch.Tensor | None:
         if self.weights.payload == 0:

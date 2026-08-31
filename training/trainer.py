@@ -177,6 +177,10 @@ class Trainer:
                     predicted_bits, loss_inputs.payload_targets
                 )
                 self._accumulate(totals, "val_payload_accuracy", torch.tensor(accuracy))
+            if loss_inputs.classification_logits is not None and loss_inputs.classification_targets is not None:
+                preds = loss_inputs.classification_logits.argmax(dim=-1)
+                host_acc = (preds == loss_inputs.classification_targets).float().mean()
+                self._accumulate(totals, "val_host_accuracy", host_acc)
             count += 1
 
         metrics = {key: value / count for key, value in totals.items()} if count else {}
@@ -370,6 +374,7 @@ class Trainer:
         # for many epochs, while the continuous BCE loss moves immediately.
         val_payload_loss = metrics.get("val_payload")
         train_payload_loss = metrics.get("train_payload")
+        val_host_accuracy = metrics.get("val_host_accuracy")
 
         parts = [f"epoch {epoch + 1}"]
         if train_loss is not None:
@@ -382,6 +387,8 @@ class Trainer:
             parts.append(f"val_payload_bce={val_payload_loss:.6f}")
         if val_payload_accuracy is not None:
             parts.append(f"val_payload_recovery_accuracy={val_payload_accuracy * 100:.4f}%")
+        if val_host_accuracy is not None:
+            parts.append(f"val_host_accuracy={val_host_accuracy * 100:.4f}%")
         print(" | ".join(parts), flush=True)
 
     @staticmethod
