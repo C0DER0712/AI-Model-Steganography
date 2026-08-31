@@ -415,7 +415,7 @@ class WeightPayloadEncoder(nn.Module):
                 features = block(features, message_features)
 
         channel_limits = torch.tensor(
-            [1.0, 4.0, 16.0, 24.0], device=features.device, dtype=torch.float32
+            [24.0, 24.0, 0.0, 0.0], device=features.device, dtype=torch.float32
         ).view(1, 4, 1, 1)
         delta = torch.tanh(self.output_projection(features)) * channel_limits
 
