@@ -40,6 +40,11 @@ payload_size = "256KB"  # 256KB = 2,097,152 bits. grid_side=1449 < image_side=15
 # Number of synthetic training samples when no real dataset is provided.
 synthetic_samples = 512
 
+# The host is fine-tuned once on all CIFAR-10 training images. Embedding uses
+# a small calibration subset; validation uses held-out test images.
+max_train_samples = 1024
+max_val_samples = 1024
+
 # Fraction reserved for validation.
 val_split = 0.1
 
@@ -233,8 +238,8 @@ eta   = 0.1   # Adaptive capacity maximisation
 # ---------------------------------------------------------------------------
 
 [training]
-max_epochs            = 1000
-batch_size            = 16
+max_epochs            = 200
+batch_size            = 64
 # Raised from 1e-4 -> 2e-3. At the old rate, real (fixed-architecture)
 # learning was measurably happening but far too slowly to be practical —
 # ~1.36 percentage points of movement over 50 epochs. Since you're

@@ -53,7 +53,6 @@ from typing import Any, TypeVar
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 import torch
-from torch.utils.data import random_split
 from torchvision import transforms
 from torchvision.datasets import CIFAR10
 
@@ -415,22 +414,25 @@ def main(argv: list[str] | None = None) -> int:
             root=str(data_root), train=False, download=args.download_dataset, transform=transform
         )
 
-        # An explicit opt-in cap is useful for smoke tests.  Do not reuse
-        # ``synthetic_samples`` here: real CIFAR-10 training needs the full set.
-        cap = data_sec.get("max_train_samples")
-        if cap is not None and cap < len(cifar_train_full):
-            cifar_train_full = torch.utils.data.Subset(cifar_train_full, range(cap))
+        # A calibration subset limits costly full-weight-image passes. The
+        # host itself was already fine-tuned on the full training split.
+        train_cap = data_sec.get("max_train_samples")
+        if train_cap is not None and train_cap < len(cifar_train_full):
+            cifar_train_full = torch.utils.data.Subset(cifar_train_full, range(train_cap))
 
-        val_n = max(1, int(len(cifar_train_full) * val_split))
-        train_n = len(cifar_train_full) - val_n
-        cifar_train, cifar_val = random_split(
-            cifar_train_full,
-            [train_n, val_n],
-            generator=torch.Generator().manual_seed(seed),
-        )
+        # Validate on CIFAR-10's official held-out test split, never on data
+        # the host saw during pretraining.
+        val_cap = data_sec.get("max_val_samples")
+        if val_cap is not None and val_cap < len(cifar_test):
+            cifar_test = torch.utils.data.Subset(cifar_test, range(val_cap))
+
+        cifar_train = cifar_train_full
+        cifar_val = cifar_test
+        train_n = len(cifar_train)
+        val_n = len(cifar_val)
 
         logger.info(
-            "CIFAR-10 dataset: %d train / %d val (held-out test set unused for now) "
+            "CIFAR-10 dataset: %d calibration-train / %d held-out-test val "
             "— %dx%d — payload %s (%d bits).",
             train_n, val_n, image_size, image_size, payload_size_str, payload_bits,
         )

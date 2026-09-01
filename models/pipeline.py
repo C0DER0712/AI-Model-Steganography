@@ -282,6 +282,12 @@ class EmbeddingPipeline(nn.Module):
         modified_repr_batch = self.encoder(original_repr_batch, payload_bits)
         # Shape: (num_replicas, 4, H, W)
 
+        # The stored model contains integer byte channels, not the encoder's
+        # continuous residual. Quantize here as well so payload recovery is
+        # trained and measured on the signal a receiver can recover. The
+        # detach/add form below preserves a straight-through encoder gradient.
+        modified_repr_batch = _quantize_byte_channels_ste(modified_repr_batch)
+
         # ---- Decoder: recover payload from each replica ----
         # Reference-based: give the decoder (modified - original) instead of
         # the raw modified representation. The residual is the encoder's pure
@@ -388,6 +394,7 @@ class EmbeddingPipeline(nn.Module):
             modified_repr = self.encoder(original_repr_batch, payload_bits)
             if isinstance(modified_repr, tuple):
                 modified_repr, _ = modified_repr
+            modified_repr = _quantize_byte_channels_ste(modified_repr)
         return modified_repr, original_repr_batch
 
     def decode(
@@ -445,6 +452,12 @@ def build_pipeline(config: PipelineConfig | None = None) -> EmbeddingPipeline:
 # ---------------------------------------------------------------------------
 # Straight-Through Estimator for byte-channel → float weight reconstruction
 # ---------------------------------------------------------------------------
+
+
+def _quantize_byte_channels_ste(channels: torch.Tensor) -> torch.Tensor:
+    """Round representation values to valid bytes with identity gradients."""
+    quantized = channels.round().clamp(0, 255)
+    return channels + (quantized - channels).detach()
 
 
 class _ChannelsToWeightsSTE(torch.autograd.Function):
