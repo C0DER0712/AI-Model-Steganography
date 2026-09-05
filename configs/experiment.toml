@@ -75,7 +75,7 @@ num_classes = 10
 pretrained = true
 
 # Create this with scripts/pretrain_host.py before the embedding run.
-checkpoint = "/kaggle/working/AI-Model-Steganography/outputs/host_pretraining/mobilenet_v2_cifar10.pt"
+checkpoint = "/kaggle/input/models/cs23b2013/mobile-net-pretrained/pytorch/default/1/mobilenet_v2_cifar10.pt"
 
 # Allow the host model to be fine-tuned alongside encoder/decoder.
 train_host_model = false

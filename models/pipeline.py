@@ -137,10 +137,22 @@ class EmbeddingPipeline(nn.Module):
         if not path.is_file():
             raise FileNotFoundError(f"Host-model checkpoint not found: {path}")
         checkpoint = torch.load(path, map_location="cpu", weights_only=True)
-        state_dict = checkpoint.get("model", checkpoint) if isinstance(checkpoint, dict) else checkpoint
+        state_dict = checkpoint
+        if isinstance(checkpoint, dict):
+            for key in ("state_dict", "model_state_dict", "model"):
+                if key in checkpoint and isinstance(checkpoint[key], dict):
+                    state_dict = checkpoint[key]
+                    break
         if not isinstance(state_dict, dict):
             raise ValueError("Host-model checkpoint must contain a state dictionary.")
-        self.host_model.load_state_dict(state_dict, strict=True)
+        # The backbone lives at self.host_model.model, whose keys are NOT
+        # "model."-prefixed. Strip that prefix if the checkpoint was saved
+        # from the adapter so the keys line up, then load into the backbone.
+        cleaned = {
+            (k[len("model."):] if k.startswith("model.") else k): v
+            for k, v in state_dict.items()
+        }
+        self.host_model.model.load_state_dict(cleaned, strict=True)
 
     def forward(
         self,
