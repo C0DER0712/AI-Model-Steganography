@@ -18,9 +18,18 @@ encoder's parameters do, because the modified representation tensor produced
 by the encoder carries ``requires_grad=True`` and the detector's activations
 are differentiable with respect to their *inputs*.
 
-Weight reconstruction uses a Straight-Through Estimator (STE) for the
-non-differentiable byte-packing step, allowing the classification loss to
-contribute gradients to the encoder.
+Representation spaces
+---------------------
+The encoder and decoder operate in **float weight space**: a single-channel
+image holding one normalised float32 value per weight. Reconstructing weights
+for the classification objective is therefore an ordinary differentiable
+affine map (``float_image_to_weights``) with no STE required.
+
+The detector still consumes the **4-channel IEEE754 byte image**. That byte
+packing is non-differentiable, so a Straight-Through Estimator
+(``_WeightsToChannelsSTE``) bridges the modified float weights into the
+detector's byte input, letting the detector-evasion loss still reach the
+encoder.
 """
 
 from __future__ import annotations
@@ -39,7 +48,11 @@ from models.decoder import DensePayloadDecoder, DecoderConfig, build_decoder
 from models.encoder import EncoderConfig, WeightPayloadEncoder, build_encoder
 from models.host_models import HostModelAdapter, HostModelConfig, HostModelName, build_host_model
 from training.losses import LossInputs
-from utils.representation import channels_to_weights, weights_to_channels
+from utils.representation import (
+    float_image_to_weights,
+    weights_to_channels,
+    weights_to_float_image,
+)
 from utils.weights import WeightTensor, extract_weights, flatten_weights
 
 
@@ -97,13 +110,24 @@ class EmbeddingPipeline(nn.Module):
 
         self._cached_weight_records: list[WeightTensor] | None = None
         self._cached_original_repr: torch.Tensor | None = None
+        # Normalisation stats for the float weight image, needed to map
+        # encoder outputs back to real weights (classification) and to bytes
+        # (detector). Set when the host model is frozen and its weights fixed.
+        self._norm_mean: float = 0.0
+        self._norm_scale: float = 1.0
+        self._num_weight_values: int = 0
         if not cfg.train_host_model:
             with torch.no_grad():
                 weight_records = extract_weights(self.host_model.model)
                 flat_weights = flatten_weights(weight_records)
-                channels_uint8 = weights_to_channels(flat_weights)
-                cached_repr = torch.from_numpy(channels_uint8.astype(np.float32))
+                float_image, stats = weights_to_float_image(flat_weights)
+                cached_repr = torch.from_numpy(float_image).float()
             self._cached_weight_records = weight_records
+            self._norm_mean = stats.mean
+            self._norm_scale = stats.scale
+            self._num_weight_values = stats.num_values
+            # Buffer name kept for backward compatibility; now holds the
+            # single-channel float image rather than the byte channels.
             self.register_buffer("_cached_original_repr_buf", cached_repr, persistent=False)
 
     def _load_host_checkpoint(self, checkpoint_path: str) -> None:
@@ -139,26 +163,31 @@ class EmbeddingPipeline(nn.Module):
         if self._cached_weight_records is not None:
             weight_records = self._cached_weight_records
             original_repr = self._cached_original_repr_buf.to(device)
+            norm_mean = self._norm_mean
+            norm_scale = self._norm_scale
         else:
             weight_records = extract_weights(self.host_model.model)
-            flat_weights = flatten_weights(weight_records).to(device)
-            channels_uint8 = weights_to_channels(flat_weights)
-            original_repr = torch.from_numpy(channels_uint8.astype(np.float32)).to(device)
+            flat_weights = flatten_weights(weight_records)
+            float_image, stats = weights_to_float_image(flat_weights)
+            original_repr = torch.from_numpy(float_image).float().to(device)
+            norm_mean = stats.mean
+            norm_scale = stats.scale
 
         num_weight_values = sum(record.values.numel() for record in weight_records)
+        # original_repr is a single-channel float image (1, side, side).
+        side = original_repr.shape[-1]
         original_repr_batch = original_repr.unsqueeze(0).expand(num_replicas, -1, -1, -1)
 
         # ---- Encoder: produce modified representation ----
         modified_repr_batch = self.encoder(original_repr_batch, payload_bits)
 
-        # Unpack tuple output FIRST if encoder returned (modified_repr, capacity_gate)
+        # Unpack tuple output if encoder returned (modified_repr, capacity_gate).
         if isinstance(modified_repr_batch, tuple):
             modified_repr_batch, capacity_gate = modified_repr_batch
         else:
             capacity_gate = None
 
-        # Quantize the Tensor after unpacking
-        modified_repr_batch = _quantize_byte_channels_ste(modified_repr_batch)
+        # No byte quantization: encoder/decoder stay in continuous float space.
 
         # ---- Decoder: recover payload from each replica ----
         if self.config.reference_decoding:
@@ -171,19 +200,32 @@ class EmbeddingPipeline(nn.Module):
             :, : self.config.payload_bits
         ]
 
-        # ---- Detector: score the modified representation ----
+        # ---- Detector: score the modified weights in byte space ----
+        # The detector consumes the 4-channel IEEE754 image, so denormalise
+        # the modified float weights back to real values and byte-pack them
+        # through the STE (the only non-differentiable hop; gradient passes
+        # straight through it back to the encoder).
         if self.config.run_detector:
-            detector_logits = self.detector(modified_repr_batch).squeeze(-1)
+            modified_flat_batch = (
+                modified_repr_batch.reshape(num_replicas, side * side) * norm_scale
+                + norm_mean
+            )
+            detector_image = _WeightsToChannelsSTE.apply(modified_flat_batch, side)
+            detector_logits = self.detector(detector_image).squeeze(-1)
             detector_targets = torch.zeros_like(detector_logits)
         else:
             detector_logits = None
             detector_targets = None
 
-        # ---- Classification with modified weights (STE) ----
+        # ---- Classification with modified weights (differentiable) ----
+        # float_image_to_weights is a plain affine map, so reconstruction is
+        # differentiable end-to-end — no STE needed on this path.
         if self.config.run_classification:
-            modified_repr_single = modified_repr_batch[0]
-            modified_flat = _ChannelsToWeightsSTE.apply(
-                modified_repr_single, len(weight_records), num_weight_values
+            modified_flat = float_image_to_weights(
+                modified_repr_batch[0],
+                mean=norm_mean,
+                scale=norm_scale,
+                num_values=num_weight_values,
             )
             modified_params = _rebuild_params(
                 modified_flat, weight_records, self.host_model.model
@@ -220,14 +262,13 @@ class EmbeddingPipeline(nn.Module):
                 payload_bits = payload_bits.unsqueeze(0)
             payload_bits = payload_bits.to(device=device, dtype=torch.float32)
             weight_records = extract_weights(self.host_model.model)
-            flat_weights = flatten_weights(weight_records).to(device)
-            channels_uint8 = weights_to_channels(flat_weights)
-            original_repr = torch.from_numpy(channels_uint8.astype(np.float32)).to(device)
+            flat_weights = flatten_weights(weight_records)
+            float_image, _stats = weights_to_float_image(flat_weights)
+            original_repr = torch.from_numpy(float_image).float().to(device)
             original_repr_batch = original_repr.unsqueeze(0)
             modified_repr = self.encoder(original_repr_batch, payload_bits)
             if isinstance(modified_repr, tuple):
                 modified_repr, _ = modified_repr
-            modified_repr = _quantize_byte_channels_ste(modified_repr)
         return modified_repr, original_repr_batch
 
     def decode(
@@ -247,10 +288,9 @@ class EmbeddingPipeline(nn.Module):
                         orig = self._cached_original_repr_buf.to(device).float()
                     else:
                         weight_records = extract_weights(self.host_model.model)
-                        flat = flatten_weights(weight_records).to(device)
-                        orig = torch.from_numpy(
-                            weights_to_channels(flat).astype("float32")
-                        ).to(device)
+                        flat = flatten_weights(weight_records)
+                        float_image, _stats = weights_to_float_image(flat)
+                        orig = torch.from_numpy(float_image).float().to(device)
                     orig = orig.unsqueeze(0).expand_as(modified_repr)
                 else:
                     orig = original_repr.to(modified_repr.device).float()
@@ -264,52 +304,59 @@ def build_pipeline(config: PipelineConfig | None = None) -> EmbeddingPipeline:
     return EmbeddingPipeline(config)
 
 
-def _quantize_byte_channels_ste(channels: torch.Tensor) -> torch.Tensor:
-    """Round representation values to valid bytes with identity gradients."""
-    quantized = channels.round().clamp(0, 255)
-    return channels + (quantized - channels).detach()
+class _WeightsToChannelsSTE(torch.autograd.Function):
+    """Byte-pack modified float32 weights into the 4-channel detector image.
 
+    Only the detector consumes the byte representation; the encoder/decoder
+    stay in float space. This STE bridges the two so the detector-evasion
+    gradient still reaches the encoder.
 
-class _ChannelsToWeightsSTE(torch.autograd.Function):
-    """Convert float representation channels back to float32 weights."""
+    Forward:
+        Denormalised modified weights (float32, shape ``(R, N)`` where
+        ``N = side * side``) are byte-decomposed via
+        :func:`utils.representation.weights_to_channels` (left unchanged) into
+        the 4-channel IEEE754 image the SRNet-style detector expects, returned
+        as float in ``[0, 255]`` with shape ``(R, 4, side, side)``.
+
+    Backward (STE):
+        Byte packing is a non-differentiable step function, so gradient is
+        propagated straight through: each weight's gradient is the sum of the
+        four byte channels that encode it, divided by the number of channels
+        (4) to preserve scale.
+    """
 
     @staticmethod
-    def forward(
+    def forward(  # type: ignore[override]
         ctx: Any,
-        channels_float: torch.Tensor,
-        weight_records: list[WeightTensor],
-        num_values: int,
+        weights_flat: torch.Tensor,
+        side: int,
     ) -> torch.Tensor:
-        ctx.save_for_backward(channels_float)
-        ctx.num_values = num_values
-        ctx.channels_shape = tuple(channels_float.shape)
-        ctx.device = channels_float.device
+        num_replicas, num_values = weights_flat.shape
+        ctx.shape = (num_replicas, num_values)
+        ctx.side = side
 
-        channels_np = (
-            channels_float.detach()
-            .round()
-            .clamp(0, 255)
-            .to(torch.uint8)
-            .cpu()
-            .numpy()
-        )
-        weights_f32 = channels_to_weights(channels_np, num_values=num_values)
-        return weights_f32.to(channels_float.device)
+        weights_np = weights_flat.detach().cpu().numpy()
+        channels = np.stack(
+            [
+                weights_to_channels(weights_np[r]).astype(np.float32)
+                for r in range(num_replicas)
+            ],
+            axis=0,
+        )  # (R, 4, side, side)
+        return torch.from_numpy(channels).to(weights_flat.device)
 
     @staticmethod
-    def backward(ctx: Any, grad_weights: torch.Tensor):
-        c, h, w = ctx.channels_shape
-        n = ctx.num_values
-        hw = h * w
+    def backward(ctx: Any, grad_channels: torch.Tensor):  # type: ignore[override]
+        num_replicas, num_values = ctx.shape
+        side = ctx.side
+        num_channels = grad_channels.shape[1]
 
-        grad_per_pixel = torch.zeros(hw, device=grad_weights.device, dtype=torch.float32)
-        num_real = min(n, hw)
-        grad_per_pixel[:num_real] = grad_weights.reshape(-1)[:num_real]
-
-        grad_channels = torch.zeros(c, h, w, device=grad_weights.device, dtype=torch.float32)
-        for ci in range(c):
-            grad_channels[ci] = grad_per_pixel.reshape(h, w)
-        return grad_channels / float(c), None, None
+        # STE: treat byte-packing as identity. Sum the per-channel gradients
+        # back onto each weight pixel, then average across channels to keep
+        # the gradient scale comparable to the forward magnitude.
+        grad_pixels = grad_channels.sum(dim=1).reshape(num_replicas, side * side)
+        grad_flat = grad_pixels[:, :num_values] / float(num_channels)
+        return grad_flat, None
 
 
 def _rebuild_params(

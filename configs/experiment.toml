@@ -102,8 +102,11 @@ reference_decoding = true
 # NOTE: payload_dim is automatically derived from data.payload_size at runtime.
 # Do NOT set payload_dim here — any value is ignored by scripts/train.py.
 # payload_dim = <auto>  →  SUPPORTED_PAYLOAD_SIZES[payload_size] * 8
-input_channels       = 4
-output_channels      = 4
+# Float32 weight representation: one normalised value per weight parameter,
+# so the encoder reads and writes a single channel (no more 4 IEEE754 byte
+# planes). (Informational — scripts/train.py uses the dataclass defaults.)
+input_channels       = 1
+output_channels      = 1
 # Architecture v2 (dense/fully-convolutional, see models/encoder.py module
 # docstring): removed chunking, per-chunk shared projection, and chunk
 # position encoding entirely — the payload is reshaped into a square bitmap
@@ -158,12 +161,13 @@ bits_per_pixel       = 4
 # The model discovers spatially non-uniform capacity — genuinely adaptive.
 adaptive_capacity    = true
 attention_reduction  = 8
-# Bound on the encoder's per-pixel residual (0-255 scale). Kept generous
-# (24) since gamma (distortion loss weight) is 0 during this payload-only
-# phase — nothing currently penalizes distortion, so there's no reason to
-# starve the payload signal. Pull this back down once gamma is
-# reintroduced for the full 4-objective run and stealth actually matters.
-max_delta            = 4.0
+# Maximum absolute per-pixel perturbation, now in NORMALISED [-1, 1] float32
+# weight space (not the old 0-255 byte scale). This is the stealth/capacity
+# dial: under reference decoding even tiny deltas recover perfectly, so keep
+# this small for a negligible classification-accuracy hit. Raise it only if
+# payload BER climbs; pull it further down once gamma (distortion) is on and
+# stealth matters. (e.g. 1e-3 is essentially invisible to the host task.)
+max_delta            = 0.05
 # Large delta for Phase 1 (curriculum warmup). With reference_decoding,
 # even small deltas give perfect payload recovery — but a larger delta
 # gives the encoder more room to write the signal cleanly before the
@@ -186,7 +190,8 @@ bits_per_pixel     = 4
 # feature extractor down to ONE output channel (a dense bit-logit map),
 # mildly pooled to the payload grid resolution. Every setting below only
 # controls the feature extractor's depth/width, exactly like a normal CNN.
-input_channels     = 4
+# 1 = single-channel float perturbation (modified_float - original_float).
+input_channels     = 1
 # Matches [encoder] base_channels — no architectural requirement that they
 # be equal, but keeping them matched avoids an unnecessary asymmetry
 # between how much capacity the encoder spends writing evidence in and how

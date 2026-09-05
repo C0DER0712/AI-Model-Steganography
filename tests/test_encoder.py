@@ -9,12 +9,11 @@ def test_encoder_returns_modified_representation_with_configured_shape() -> None
         payload_dim=16,
         base_channels=8,
         num_residual_blocks=2,
-        payload_embedding_dim=12,
         attention_reduction=4,
         max_delta=0.25,
     )
     encoder = WeightPayloadEncoder(config)
-    weights = torch.rand(2, 4, 8, 8)
+    weights = torch.rand(2, 1, 8, 8)
     payload = torch.randint(0, 2, (2, 16), dtype=torch.uint8)
 
     output, gate = encoder(weights, payload)
@@ -23,7 +22,6 @@ def test_encoder_returns_modified_representation_with_configured_shape() -> None
     assert output.dtype == weights.dtype
     assert gate is None
     assert torch.max(torch.abs(output - weights)) <= config.max_delta + 1e-6
-    assert torch.equal(output[:, :2], weights[:, :2])
 
 
 def test_encoder_is_differentiable() -> None:
@@ -32,11 +30,10 @@ def test_encoder_is_differentiable() -> None:
             payload_dim=8,
             base_channels=4,
             num_residual_blocks=1,
-            payload_embedding_dim=8,
             attention_reduction=2,
         )
     )
-    weights = torch.rand(1, 4, 4, 4, requires_grad=True)
+    weights = torch.rand(1, 1, 4, 4, requires_grad=True)
     payload = torch.randint(0, 2, (1, 8), dtype=torch.float32)
 
     output, _ = encoder(weights, payload)
@@ -57,4 +54,4 @@ def test_encoder_validates_input_shapes() -> None:
         encoder(torch.rand(1, 3, 8, 8), torch.rand(1, 8))
 
     with pytest.raises(ValueError, match="payload_dim"):
-        encoder(torch.rand(1, 4, 8, 8), torch.rand(1, 7))
+        encoder(torch.rand(1, 1, 8, 8), torch.rand(1, 7))

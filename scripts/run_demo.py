@@ -258,7 +258,7 @@ def _generate_malicious_checkpoints(
     Returns:
         List of paths to the saved checkpoints.
     """
-    from utils.representation import channels_to_weights
+    from utils.representation import weights_to_float_image, float_image_to_weights
     from utils.weights import extract_weights, flatten_weights, restore_weights, load_modified_weights
     import copy
 
@@ -272,20 +272,19 @@ def _generate_malicious_checkpoints(
 
         with torch.no_grad():
             modified_repr, _ = pipeline.encode(payload.to(device))
-            # modified_repr: (1, 4, H, W) float32
+            # modified_repr: (1, 1, H, W) float32 image in normalised [-1, 1]
 
-        # Convert the modified representation back to flat float32 weights.
-        repr_np = (
-            modified_repr.squeeze(0)
-            .detach()
-            .cpu()
-            .clamp(0, 255)
-            .byte()
-            .numpy()
-        )
+        # Convert the modified float image back to flat float32 weights using
+        # the same normalisation stats the pipeline cached for this host model.
         weight_records = extract_weights(pipeline.host_model.model)
         num_values = sum(r.values.numel() for r in weight_records)
-        flat_modified = channels_to_weights(repr_np, num_values=num_values)
+        _, stats = weights_to_float_image(flatten_weights(weight_records))
+        flat_modified = float_image_to_weights(
+            modified_repr.squeeze(0).detach().cpu(),
+            mean=stats.mean,
+            scale=stats.scale,
+            num_values=num_values,
+        )
 
         # Rebuild the full state_dict with modified floating-point parameters.
         restored = restore_weights(flat_modified, weight_records)

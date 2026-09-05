@@ -29,7 +29,7 @@ def _tiny_enc() -> EncoderConfig:
 
 
 def _tiny_dec() -> DecoderConfig:
-    return DecoderConfig(base_channels=8, num_residual_blocks=1, chunk_size=PAYLOAD_BITS)
+    return DecoderConfig(base_channels=8, num_residual_blocks=1)
 
 
 def _tiny_det() -> DifferentiableDetectorConfig:
@@ -221,12 +221,12 @@ class TestEncodeDecodeMethods:
         modified, original = pipeline.encode(bits)
         assert modified.shape == original.shape
         assert modified.ndim == 4
-        assert modified.shape[1] == 4  # 4-channel representation
+        assert modified.shape[1] == 1  # single-channel float representation
 
     def test_decode_returns_bit_tensor(self, pipeline: EmbeddingPipeline) -> None:
         bits = torch.randint(0, 2, (PAYLOAD_BITS,), dtype=torch.float32)
         modified, _ = pipeline.encode(bits)
-        decoded = pipeline.decode(modified, PAYLOAD_BITS)
+        decoded = pipeline.decode(modified, num_bits=PAYLOAD_BITS)
         assert decoded.shape == (1, PAYLOAD_BITS)
         assert decoded.dtype == torch.uint8
         assert torch.all((decoded == 0) | (decoded == 1))

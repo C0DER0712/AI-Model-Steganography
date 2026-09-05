@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import math
+from dataclasses import dataclass
 from pathlib import Path
 
 import matplotlib
@@ -90,6 +91,129 @@ def channels_to_weights(
 
     values = bits.astype(np.uint32, copy=False).view(np.float32).copy()
     return torch.from_numpy(values)
+
+
+@dataclass(frozen=True)
+class FloatImageStats:
+    """Normalisation statistics for a float32 weight image.
+
+    Produced by :func:`weights_to_float_image` and consumed by
+    :func:`float_image_to_weights` to invert the normalisation *exactly*.
+
+    Attributes:
+        mean: Mean subtracted from the raw weights before scaling.
+        scale: Positive divisor applied after centring (max absolute
+            centred weight), so the normalised image lies in ``[-1, 1]``.
+        num_values: Number of real (unpadded) weight values.
+        side: Side length of the square spatial image.
+    """
+
+    mean: float
+    scale: float
+    num_values: int
+    side: int
+
+
+def weights_to_float_image(
+    weights: torch.Tensor | np.ndarray,
+) -> tuple[np.ndarray, FloatImageStats]:
+    """Flatten and normalise float32 weights into a 1-channel spatial image.
+
+    Unlike :func:`weights_to_channels` (which byte-decomposes each float into
+    four IEEE754 planes), this keeps the weights in continuous float32 space:
+    one normalised value per weight parameter, laid out on a square grid.
+    Normalisation is a symmetric mean-centred max-abs affine::
+
+        image = (weights - mean) / scale        with  scale = max|weights - mean|
+
+    which maps the real weights exactly into ``[-1, 1]`` and is exactly
+    invertible via :func:`float_image_to_weights` (no precision loss, no
+    dangerous byte planes to zero out). Padding cells added to square the
+    grid are filled with ``0.0`` (the normalised mean) and are dropped again
+    on inversion using ``stats.num_values``.
+
+    This is the representation the encoder/decoder operate in. The byte
+    representation from :func:`weights_to_channels` is kept separate and is
+    only used for the SRNet-style detector forward pass.
+
+    Args:
+        weights: Tensor or array of float-compatible weight values.
+
+    Returns:
+        Tuple ``(image, stats)`` where ``image`` is a ``float32`` array with
+        shape ``(1, side, side)`` in ``[-1, 1]`` and ``stats`` carries the
+        ``mean``/``scale``/``num_values``/``side`` needed to invert it.
+    """
+
+    values = _to_float32_numpy(weights).reshape(-1)
+    num_values = int(values.size)
+    side = _square_side(num_values)
+    padded_size = side * side
+
+    if num_values == 0:
+        image = np.zeros((1, side, side), dtype=np.float32)
+        return image, FloatImageStats(mean=0.0, scale=1.0, num_values=0, side=side)
+
+    mean = float(values.mean())
+    centred = values - mean
+    scale = float(np.abs(centred).max())
+    if scale < 1e-12:
+        # All weights identical: avoid divide-by-zero; the (zero) residual is
+        # representable and inversion still returns the constant weights.
+        scale = 1.0
+
+    normalised = centred / scale
+    if padded_size != num_values:
+        normalised = np.pad(
+            normalised, (0, padded_size - num_values), constant_values=0.0
+        )
+
+    image = normalised.reshape(1, side, side).astype(np.float32, copy=False)
+    return image, FloatImageStats(
+        mean=mean, scale=scale, num_values=num_values, side=side
+    )
+
+
+def float_image_to_weights(
+    image: torch.Tensor | np.ndarray,
+    *,
+    mean: float = 0.0,
+    scale: float = 1.0,
+    num_values: int | None = None,
+) -> torch.Tensor:
+    """Invert :func:`weights_to_float_image` back to flat float32 weights.
+
+    The inverse is the affine ``weights = image * scale + mean`` applied to
+    the flattened image. When ``image`` is a ``torch.Tensor`` this is fully
+    differentiable and preserves the autograd graph, so the classification
+    objective can push gradients through weight reconstruction straight to
+    the encoder — no straight-through estimator needed (the byte-packing
+    path is the only non-differentiable one, and it is used solely for the
+    detector).
+
+    Args:
+        image: ``(1, side, side)`` / ``(side, side)`` / flat float image, as a
+            torch tensor (keeps grad) or numpy array.
+        mean: ``FloatImageStats.mean`` used during normalisation.
+        scale: ``FloatImageStats.scale`` used during normalisation.
+        num_values: Optional number of real, unpadded weights to return
+            (drops the square-padding cells).
+
+    Returns:
+        One-dimensional ``torch.float32`` tensor of weight values.
+    """
+
+    if isinstance(image, torch.Tensor):
+        flat = image.reshape(-1)
+        if num_values is not None:
+            flat = flat[:num_values]
+        return flat.to(dtype=torch.float32) * scale + mean
+
+    flat_np = np.asarray(image, dtype=np.float32).reshape(-1)
+    if num_values is not None:
+        flat_np = flat_np[:num_values]
+    weights = flat_np * np.float32(scale) + np.float32(mean)
+    return torch.from_numpy(weights.astype(np.float32, copy=False))
 
 
 def visualize_channels(

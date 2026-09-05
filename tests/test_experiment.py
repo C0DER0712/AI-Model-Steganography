@@ -60,7 +60,7 @@ def _tiny_pipeline_config() -> PipelineConfig:
             payload_dim=PAYLOAD_BITS, base_channels=8, num_residual_blocks=1
         ),
         decoder=DecoderConfig(
-            base_channels=8, num_residual_blocks=1, chunk_size=PAYLOAD_BITS
+            base_channels=8, num_residual_blocks=1
         ),
         detector=DifferentiableDetectorConfig(
             hpf_channels=4, base_channels=4, num_type1_blocks=1,

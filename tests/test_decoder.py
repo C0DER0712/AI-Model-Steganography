@@ -27,7 +27,7 @@ def test_decoder_forward_returns_flat_logits() -> None:
     """forward() returns (batch, grid_side*grid_side) logits."""
     import math
     decoder = build_decoder(_small_config())
-    representation = torch.rand(2, 4, 32, 32)
+    representation = torch.rand(2, 1, 32, 32)
     num_bits = 64
 
     logits = decoder(representation, num_bits=num_bits)
@@ -40,7 +40,7 @@ def test_decoder_forward_various_payload_sizes() -> None:
     """forward() works for several different num_bits values."""
     import math
     decoder = build_decoder(_small_config())
-    representation = torch.rand(1, 4, 64, 64)
+    representation = torch.rand(1, 1, 64, 64)
 
     for num_bits in [8, 64, 128, 1024]:
         logits = decoder(representation, num_bits=num_bits)
@@ -72,7 +72,7 @@ def test_reconstruct_payload_packs_decoded_bits() -> None:
 
 def test_decoder_reconstruct_payload_method() -> None:
     decoder = build_decoder(_small_config())
-    representation = torch.rand(1, 4, 64, 64)
+    representation = torch.rand(1, 1, 64, 64)
 
     payloads = decoder.reconstruct_payload(representation, num_bits=128 * 8)
 
@@ -98,7 +98,7 @@ def test_decoder_validates_inputs() -> None:
         decoder(torch.rand(1, 3, 8, 8), num_bits=8)
 
     with pytest.raises(ValueError, match="num_bits"):
-        decoder(torch.rand(1, 4, 8, 8), num_bits=0)
+        decoder(torch.rand(1, 1, 8, 8), num_bits=0)
 
 
 def test_parameter_count_independent_of_num_bits() -> None:
@@ -106,8 +106,8 @@ def test_parameter_count_independent_of_num_bits() -> None:
     decoder = build_decoder(_small_config())
     before = sum(p.numel() for p in decoder.parameters())
 
-    decoder(torch.rand(1, 4, 32, 32), num_bits=64)
-    decoder(torch.rand(1, 4, 32, 32), num_bits=4096)
+    decoder(torch.rand(1, 1, 32, 32), num_bits=64)
+    decoder(torch.rand(1, 1, 32, 32), num_bits=4096)
 
     after = sum(p.numel() for p in decoder.parameters())
     assert after == before

@@ -69,14 +69,16 @@ class AdaptiveCapacityGate(nn.Module):
     residual signal it sees through reference_decoding).
     """
 
-    def __init__(self, input_channels=4, hidden_channels=16, bits_per_pixel=1):
+    def __init__(self, input_channels=1, hidden_channels=16):
         super().__init__()
         # Lightweight 2-layer conv: learns local weight statistics that
-        # predict how much perturbation each pixel can absorb.
+        # predict how much perturbation each pixel can absorb. The gate is a
+        # single scalar per spatial position (one float weight per pixel now),
+        # so the final conv always emits exactly one channel.
         self.net = nn.Sequential(
             nn.Conv2d(input_channels, hidden_channels, kernel_size=3, padding=1),
             nn.GELU(),
-            nn.Conv2d(hidden_channels, bits_per_pixel, kernel_size=1),  # ← changed
+            nn.Conv2d(hidden_channels, 1, kernel_size=1),
             nn.Sigmoid(),
         )
 
@@ -94,8 +96,11 @@ class EncoderConfig:
     """Configuration for `WeightPayloadEncoder`.
 
     Attributes:
-        input_channels: Number of input weight-representation channels. Model
-            X-Ray GF representations use four channels: p0, p1, p2, p3.
+        input_channels: Number of input weight-representation channels. The
+            encoder now operates in float weight space: one normalised
+            float32 value per weight, so this is a single channel (the
+            4-channel IEEE754 byte representation is used only by the
+            detector, converted at its forward pass in the pipeline).
         output_channels: Number of output representation channels.
         payload_dim: Number of payload tensor elements expected per sample.
         base_channels: Width of the convolutional feature backbone.
@@ -120,8 +125,8 @@ class EncoderConfig:
             ~8-12GB VRAM.
     """
 
-    input_channels: int = 4
-    output_channels: int = 4
+    input_channels: int = 1
+    output_channels: int = 1
     payload_dim: int = 1024
     base_channels: int = 64
     num_residual_blocks: int = 4
@@ -139,7 +144,12 @@ class EncoderConfig:
     adaptive_capacity: bool = False
     message_prep_layers: int = 2
     attention_reduction: int = 8
-    max_delta: float = 1.0
+    # Maximum absolute per-pixel perturbation, in NORMALISED [-1, 1] float
+    # weight space (no longer the 0-255 byte scale). This is the single
+    # stealth/capacity dial now that channel_limits is gone; keep it small so
+    # the host task barely moves. Under reference decoding even tiny deltas
+    # recover the payload perfectly.
+    max_delta: float = 0.05
     gradient_checkpointing: bool = False
 
 
@@ -325,7 +335,7 @@ class WeightPayloadEncoder(nn.Module):
             num_layers=config.message_prep_layers,
             bits_per_pixel=config.bits_per_pixel,
         )
-        # Stem projects four byte channels into a learned feature space.
+        # Stem projects the single float weight channel into feature space.
         self.stem = ConvNormActivation(config.input_channels, config.base_channels)
         # Residual blocks learn content-aware, payload-conditioned edit features.
         self.blocks = nn.ModuleList(
@@ -338,7 +348,7 @@ class WeightPayloadEncoder(nn.Module):
                 for _ in range(config.num_residual_blocks)
             ]
         )
-        # Head maps features back to the four-channel representation domain.
+        # Head maps features back to the single-channel float weight domain.
         self.output_projection = nn.Conv2d(
             config.base_channels,
             config.output_channels,
@@ -352,7 +362,6 @@ class WeightPayloadEncoder(nn.Module):
             AdaptiveCapacityGate(
                 input_channels=config.input_channels,
                 hidden_channels=max(8, config.base_channels // 4),
-                bits_per_pixel=config.bits_per_pixel,
             )
             if config.adaptive_capacity
             else None
@@ -364,7 +373,7 @@ class WeightPayloadEncoder(nn.Module):
         """Produce a modified weight representation.
 
         Args:
-            weight_representation: Tensor with shape `(batch, 4, height, width)`.
+            weight_representation: Tensor with shape `(batch, 1, height, width)`.
             payload: Tensor with shape `(batch, payload_dim)`.
 
         Returns:
@@ -416,14 +425,12 @@ class WeightPayloadEncoder(nn.Module):
             else:
                 features = block(features, message_features)
 
-        # p0 and p1 contain the IEEE-754 sign and exponent bits. Altering
-        # either can create infinities/NaNs or change a weight's magnitude by
-        # orders of magnitude. Restrict embedding to the two mantissa-only
-        # byte planes, where max_delta bounds the perturbation safely.
-        channel_limits = features.new_tensor(
-            [0.0, 0.0, self.config.max_delta, self.config.max_delta]
-        ).view(1, 4, 1, 1)
-        delta = torch.tanh(self.output_projection(features)) * channel_limits
+        # Working directly in normalised float weight space, every pixel is a
+        # single real weight value, so there are no sign/exponent bytes to
+        # protect and no per-channel masking. tanh bounds the raw prediction
+        # to (-1, 1); scaling by max_delta caps the absolute perturbation at
+        # |delta| <= max_delta uniformly across all pixels.
+        delta = torch.tanh(self.output_projection(features)) * self.config.max_delta
 
         # Adaptive capacity gate: learned per-pixel soft mask g ∈ [0,1].
         # Pixels where g→0 receive near-zero perturbation — those bits

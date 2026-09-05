@@ -306,7 +306,9 @@ def main(argv: list[str] | None = None) -> int:
         message_channels=enc_sec.get("message_channels", 32),
         message_prep_layers=enc_sec.get("message_prep_layers", 2),
         attention_reduction=enc_sec.get("attention_reduction", 8),
-        max_delta=enc_sec.get("max_delta", 1.0),
+        # max_delta is now the bound in normalised [-1, 1] float weight space
+        # (see EncoderConfig.max_delta); small by default for stealth.
+        max_delta=enc_sec.get("max_delta", 0.05),
         gradient_checkpointing=enc_sec.get("gradient_checkpointing", False),
         bits_per_pixel=bits_per_pixel,
         adaptive_capacity=enc_sec.get("adaptive_capacity", False),

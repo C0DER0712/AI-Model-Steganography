@@ -215,17 +215,19 @@ def main(argv: list[str] | None = None) -> int:
             original_weight_list.append(flat_weights_cpu.clone())
 
             # Reconstruct flat modified weights for detector evaluation.
-            from utils.representation import channels_to_weights
-            mod_channels_np = (
-                modified_repr[0]
-                .detach()
-                .round()
-                .clamp(0, 255)
-                .to(torch.uint8)
-                .cpu()
-                .numpy()
+            # The representation is now a single-channel float image in
+            # normalised [-1, 1] space; invert with the host model's stats.
+            from utils.representation import (
+                weights_to_float_image,
+                float_image_to_weights,
             )
-            modified_flat = channels_to_weights(mod_channels_np, num_values=flat_weights_cpu.numel())
+            _, stats = weights_to_float_image(flat_weights_cpu)
+            modified_flat = float_image_to_weights(
+                modified_repr[0].detach().cpu(),
+                mean=stats.mean,
+                scale=stats.scale,
+                num_values=flat_weights_cpu.numel(),
+            )
             modified_weight_list.append(modified_flat.cpu())
             payload_bits_list.append(bits.cpu().to(dtype=torch.uint8))
             decoded_bits_list.append(decoded[0])

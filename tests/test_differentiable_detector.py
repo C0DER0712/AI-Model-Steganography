@@ -100,8 +100,16 @@ class TestDifferentiability:
     def test_encoder_receives_gradient_through_detector(
         self, small_config: DifferentiableDetectorConfig
     ) -> None:
-        """Simulate the adversarial training scenario end-to-end."""
+        """Simulate the adversarial training scenario end-to-end.
+
+        The encoder now operates in single-channel float weight space, while
+        the detector still consumes the 4-channel IEEE754 byte image. The
+        pipeline bridges the two with a straight-through estimator
+        (``_WeightsToChannelsSTE``), so a detector-evasion gradient must still
+        reach the encoder across that non-differentiable byte-packing step.
+        """
         from models.encoder import EncoderConfig, WeightPayloadEncoder
+        from models.pipeline import _WeightsToChannelsSTE
 
         enc_cfg = EncoderConfig(
             payload_dim=16,
@@ -111,18 +119,23 @@ class TestDifferentiability:
         encoder = WeightPayloadEncoder(enc_cfg)
         det = DifferentiableDetector(small_config)
 
-        weight_repr = torch.randn(1, 4, 32, 32)
+        side = 32
+        weight_repr = torch.randn(1, 1, side, side)  # single-channel float image
         payload = torch.randint(0, 2, (1, 16), dtype=torch.float32)
 
-        modified = encoder(weight_repr, payload)
-        logits = det(modified)
+        modified, _gate = encoder(weight_repr, payload)  # (1, 1, side, side)
+        # Bridge float weight space -> 4-channel detector bytes via the STE,
+        # exactly as EmbeddingPipeline.forward does before the detector call.
+        modified_flat = modified.reshape(1, side * side)
+        det_image = _WeightsToChannelsSTE.apply(modified_flat, side)  # (1, 4, side, side)
+        logits = det(det_image)
         benign_target = torch.zeros_like(logits)
 
         import torch.nn.functional as F
         loss = F.binary_cross_entropy_with_logits(logits, benign_target)
         loss.backward()
 
-        # Encoder must have received gradients.
+        # Encoder must have received gradients across the STE bridge.
         enc_grads = [p.grad for p in encoder.parameters() if p.grad is not None]
         assert len(enc_grads) > 0, "Encoder received no gradients from detector loss."
 

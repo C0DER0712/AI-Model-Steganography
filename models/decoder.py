@@ -42,7 +42,10 @@ class DecoderConfig:
     """Configuration for `DensePayloadDecoder`.
 
     Attributes:
-        input_channels: Number of input Model-XRay representation channels.
+        input_channels: Number of input representation channels. Under the
+            float32 representation the decoder receives the single-channel
+            pure perturbation ``modified_float - original_float`` (see
+            ``PipelineConfig.reference_decoding``), so this is 1.
         base_channels: Width of the convolutional feature extractor.
         num_residual_blocks: Number of residual CNN blocks in the extractor.
         attention_reduction: Reduction ratio for channel attention.
@@ -52,22 +55,20 @@ class DecoderConfig:
             `EncoderConfig.gradient_checkpointing` for rationale.
     """
 
-    input_channels: int = 4
+    input_channels: int = 1
     base_channels: int = 64
     num_residual_blocks: int = 4
     attention_reduction: int = 8
     gradient_checkpointing: bool = False
-    # Number of independent payload bits encoded per spatial position in the
-    # weight image.  With reference_decoding=True the decoder sees the pure
-    # encoder residual, so each of the 4 IEEE754 byte-channels independently
-    # carries its own bit signal.  bits_per_pixel=1 (default) is the original
-    # single-bit-per-pixel design (ceiling ~277KB for MobileNetV2).  Higher
-    # values multiply capacity at the cost of the encoder having to fit more
-    # independent signals into the per-pixel residual.  Practical ceiling:
-    #   bpp=1 ->  277KB / 3.1% embed rate  (proven, no cross-bit interference)
-    #   bpp=2 ->  554KB / 6.3% embed rate
-    #   bpp=4 -> 1109KB / 12.5% embed rate (each of the 4 byte channels carries 1 bit)
-    #   bpp=8 -> 2218KB / 25.0% embed rate (theoretical only; likely too noisy)
+    # Number of independent payload bits encoded per spatial position (weight
+    # pixel).  With reference_decoding=True the decoder sees the pure encoder
+    # perturbation in float space, so each grid cell's bits are read straight
+    # off the (noise-free) residual.  bits_per_pixel=1 (default) is the
+    # single-bit-per-pixel design; higher values multiply capacity at the cost
+    # of the encoder having to pack more independent signals into the per-pixel
+    # residual magnitude/pattern.  The message-conditioning machinery is
+    # independent of the number of weight-image channels, so bpp>1 still works
+    # with the single float channel — it is just a harder embedding problem.
     # Requires encoder.bits_per_pixel to match this value exactly.
     bits_per_pixel: int = 1
 
@@ -79,7 +80,7 @@ class ConvNormActivation(nn.Module):
         super().__init__()
         padding = kernel_size // 2
 
-        # Conv2d learns local structure in the four IEEE754 byte planes.
+        # Conv2d learns local structure in the single-channel float residual.
         self.conv = nn.Conv2d(
             in_channels,
             out_channels,
@@ -160,7 +161,7 @@ class DensePayloadDecoder(nn.Module):
         _validate_config(config)
         self.config = config
 
-        # Stem projects four byte channels into a learned feature space.
+        # Stem projects the single float channel into a learned feature space.
         self.stem = ConvNormActivation(config.input_channels, config.base_channels)
         # Residual blocks extract payload-reconstruction evidence.
         self.blocks = nn.ModuleList(
@@ -176,9 +177,9 @@ class DensePayloadDecoder(nn.Module):
         # independent dense logit map for one bit-plane.  With bpp=1
         # (default) this is identical to the original single-channel design.
         # Higher bpp values let each spatial position carry multiple
-        # independent bits — the encoder's FiLM conditioning learns to
-        # write each bit-plane into a distinct combination of the 4 IEEE754
-        # byte channels, and the decoder reverses that mapping here.
+        # independent bits — the encoder's FiLM conditioning learns to write
+        # each bit-plane into a distinct pattern of the single-channel float
+        # residual, and the decoder reverses that mapping here.
         self.logit_projection = nn.Conv2d(
             config.base_channels, config.bits_per_pixel, kernel_size=1
         )
@@ -187,7 +188,7 @@ class DensePayloadDecoder(nn.Module):
         """Reconstruct payload logits from a weight representation.
 
         Args:
-            weight_representation: Tensor with shape `(batch, 4, height, width)`.
+            weight_representation: Tensor with shape `(batch, 1, height, width)`.
             num_bits: Number of real payload bits to reconstruct (before
                 padding to a square grid).
 
@@ -239,7 +240,7 @@ class DensePayloadDecoder(nn.Module):
         """Decode payload bits by thresholding reconstructed logits.
 
         Args:
-            weight_representation: Tensor with shape `(batch, 4, height, width)`.
+            weight_representation: Tensor with shape `(batch, 1, height, width)`.
             num_bits: Number of real payload bits to return.
             threshold: Logit threshold used to map logits to binary bits.
 
@@ -261,7 +262,7 @@ class DensePayloadDecoder(nn.Module):
         """Decode and pack payload bits back into byte strings.
 
         Args:
-            weight_representation: Tensor with shape `(batch, 4, height, width)`.
+            weight_representation: Tensor with shape `(batch, 1, height, width)`.
             num_bits: Number of real payload bits to return. Must be divisible
                 by 8 to pack complete bytes.
             threshold: Logit threshold used to map logits to binary bits.
