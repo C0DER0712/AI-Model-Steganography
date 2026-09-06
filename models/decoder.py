@@ -199,6 +199,13 @@ class DensePayloadDecoder(nn.Module):
         """
 
         self._validate_inputs(weight_representation, num_bits)
+
+        # Mirror the encoder guard: disable autocast so that the large
+        # weight-image feature maps never run in float16.
+        if torch.is_autocast_enabled():
+            with torch.amp.autocast(device_type="cuda", enabled=False):
+                return self.forward(weight_representation, num_bits)
+
         original_dtype = weight_representation.dtype
 
         features = self.stem(weight_representation.to(dtype=torch.float32))

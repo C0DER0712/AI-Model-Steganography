@@ -386,6 +386,16 @@ class WeightPayloadEncoder(nn.Module):
 
         self._validate_inputs(weight_representation, payload)
 
+        # The encoder operates on a ~1500x1500 weight image.  float16
+        # intermediate feature maps overflow at this spatial scale, producing
+        # NaN loss from the very first batch.  Disable autocast here so all
+        # Conv2d / GroupNorm ops run in float32 regardless of the trainer's
+        # mixed-precision setting.  The classification and detector paths
+        # (which operate on small 224x224 images) still benefit from AMP.
+        if torch.is_autocast_enabled():
+            with torch.amp.autocast(device_type="cuda", enabled=False):
+                return self.forward(weight_representation, payload)
+
         original_dtype = weight_representation.dtype
         weight_representation = weight_representation.to(dtype=torch.float32)
         _, _, height, width = weight_representation.shape

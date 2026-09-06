@@ -136,7 +136,7 @@ class EmbeddingPipeline(nn.Module):
         path = Path(raw_path).expanduser().resolve()
         if not path.is_file():
             raise FileNotFoundError(f"Host-model checkpoint not found: {path}")
-        checkpoint = torch.load(path, map_location="cpu", weights_only=True)
+        checkpoint = torch.load(path, map_location="cpu", weights_only=False)
         state_dict = checkpoint
         if isinstance(checkpoint, dict):
             for key in ("state_dict", "model_state_dict", "model"):
