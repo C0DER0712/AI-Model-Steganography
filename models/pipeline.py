@@ -105,6 +105,11 @@ class EmbeddingPipeline(nn.Module):
         if not cfg.train_host_model:
             for param in self.host_model.parameters():
                 param.requires_grad_(False)
+            # Keep frozen host permanently in eval so BatchNorm never runs
+            # its in-place running-stat update during functional_call.
+            # In train mode each forward corrupts running_mean/running_var,
+            # dropping host accuracy from ~95 % to random within one epoch.
+            self.host_model.eval()
 
         self.detector.freeze()
 
@@ -153,6 +158,23 @@ class EmbeddingPipeline(nn.Module):
             for k, v in state_dict.items()
         }
         self.host_model.model.load_state_dict(cleaned, strict=True)
+
+    # ------------------------------------------------------------------
+    # Training-mode override
+    # ------------------------------------------------------------------
+
+    def train(self, mode: bool = True) -> "EmbeddingPipeline":
+        """Set training mode, but keep a frozen host model in eval.
+
+        ``nn.Module.train()`` recurses into every child including
+        ``self.host_model``.  For a frozen host that must not have
+        its BatchNorm running statistics corrupted by functional_call
+        during training, we immediately restore eval mode afterward.
+        """
+        super().train(mode)
+        if not self.config.train_host_model:
+            self.host_model.eval()
+        return self
 
     def forward(
         self,
