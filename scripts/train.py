@@ -392,6 +392,7 @@ def main(argv: list[str] | None = None) -> int:
         save_best_only=_resolve(None, train_sec.get("save_best_only"), False),
         monitor=train_sec.get("monitor"),
         monitor_mode=train_sec.get("monitor_mode", "min"),
+        minimum_host_accuracy=train_sec.get("minimum_host_accuracy"),
     )
 
     # ---- Build image datasets ----

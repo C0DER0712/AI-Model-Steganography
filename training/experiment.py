@@ -80,6 +80,7 @@ class ExperimentConfig:
     save_best_only: bool = False
     monitor: str | None = None
     monitor_mode: str = "min"
+    minimum_host_accuracy: float | None = None
     num_workers: int = 0
     # Curriculum learning: number of epochs over which alpha (classification
     # loss weight) is linearly ramped from 0 up to its configured target value.
@@ -190,6 +191,25 @@ class SteganographyExperiment:
             cfg.loss_weights.detector,
         )
         pipeline = EmbeddingPipeline(pipeline_cfg)
+        if val_loader is not None and cfg.loss_weights.classification > 0:
+            host_device = _resolve_experiment_device(cfg.device)
+            baseline_accuracy = _evaluate_host_baseline(
+                pipeline, val_loader, host_device
+            )
+            logger.info(
+                "Loaded host baseline accuracy on validation data: %.2f%%",
+                100.0 * baseline_accuracy,
+            )
+            if (
+                cfg.minimum_host_accuracy is not None
+                and baseline_accuracy < cfg.minimum_host_accuracy
+            ):
+                raise ValueError(
+                    f"Loaded host baseline accuracy {baseline_accuracy:.2%} is below "
+                    f"the configured minimum {cfg.minimum_host_accuracy:.2%}. "
+                    "Check --host-checkpoint, class count, and data transforms "
+                    "before starting embedding."
+                )
         logger.info(
             "Pipeline built: host=%s, encoder params=%d, decoder params=%d",
             cfg.pipeline.host_model_name,
@@ -481,6 +501,33 @@ def run_experiment(
 # ---------------------------------------------------------------------------
 # Batch adapter
 # ---------------------------------------------------------------------------
+
+
+@torch.no_grad()
+def _evaluate_host_baseline(
+    pipeline: EmbeddingPipeline,
+    data_loader: Iterable[Any],
+    device: torch.device,
+) -> float:
+    """Measure the loaded, unmodified host before training the embedder."""
+    pipeline.host_model.to(device).eval()
+    correct = total = 0
+    for batch in data_loader:
+        images, labels = batch[0].to(device), batch[1].to(device)
+        predictions = pipeline.host_model(images).argmax(dim=1)
+        correct += int((predictions == labels).sum().item())
+        total += int(labels.numel())
+    return correct / total if total else 0.0
+
+
+def _resolve_experiment_device(value: str) -> torch.device:
+    if value.lower() == "auto":
+        if torch.cuda.is_available():
+            return torch.device("cuda")
+        if hasattr(torch.backends, "mps") and torch.backends.mps.is_available():
+            return torch.device("mps")
+        return torch.device("cpu")
+    return torch.device(value.lower())
 
 
 def _pipeline_batch_adapter(

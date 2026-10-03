@@ -35,6 +35,7 @@ encoder.
 from __future__ import annotations
 
 import math
+import logging
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
@@ -54,6 +55,8 @@ from utils.representation import (
     weights_to_float_image,
 )
 from utils.weights import WeightTensor, extract_weights, flatten_weights
+
+logger = logging.getLogger(__name__)
 
 
 @dataclass(frozen=True)
@@ -94,7 +97,10 @@ class EmbeddingPipeline(nn.Module):
         self.host_model: HostModelAdapter = build_host_model(
             cfg.host_model_name,
             num_classes=cfg.host_model_num_classes,
-            pretrained=cfg.host_model_pretrained,
+            # A task checkpoint fully replaces initialization weights. Avoid
+            # downloading ImageNet weights (and creating a random task head)
+            # when the checkpoint will be loaded immediately afterward.
+            pretrained=cfg.host_model_pretrained and cfg.host_model_checkpoint is None,
         )
         if cfg.host_model_checkpoint is not None:
             self._load_host_checkpoint(cfg.host_model_checkpoint)
@@ -181,6 +187,7 @@ class EmbeddingPipeline(nn.Module):
             for k, v in state_dict.items()
         }
         self.host_model.model.load_state_dict(cleaned, strict=True)
+        logger.info("Loaded task host checkpoint from %s", path)
 
     # ------------------------------------------------------------------
     # Training-mode override

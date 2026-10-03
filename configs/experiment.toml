@@ -249,6 +249,7 @@ max_epochs            = 200
 batch_size            = 64
 monitor               = "val_host_accuracy"
 monitor_mode          = "max"
+minimum_host_accuracy = 0.50
 # Raised from 1e-4 -> 2e-3. At the old rate, real (fixed-architecture)
 # learning was measurably happening but far too slowly to be practical —
 # ~1.36 percentage points of movement over 50 epochs. Since you're
@@ -256,7 +257,7 @@ monitor_mode          = "max"
 # there's no competing objective to destabilize, so it's safe to be
 # aggressive here. Pull this back down once you reintroduce
 # classification/distortion/detector losses.
-learning_rate         = 1.0e-3
+learning_rate         = 2.0e-4
 # Slightly lower than pure payload-only (2e-3) but higher than fixed
 # multi-objective (5e-4): the curriculum warm-up phase (alpha=0) means the
 # first N epochs are effectively single-objective, so we can afford a

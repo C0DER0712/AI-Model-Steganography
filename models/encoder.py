@@ -355,6 +355,13 @@ class WeightPayloadEncoder(nn.Module):
             kernel_size=3,
             padding=1,
         )
+        # Start as an exact identity on the host weights. A randomly
+        # initialized dense residual changes millions of classifier weights
+        # before the preservation objective can react, often collapsing a
+        # good host to chance accuracy on the very first step. Zero-init the
+        # final projection so training learns a payload residual from zero.
+        nn.init.zeros_(self.output_projection.weight)
+        nn.init.zeros_(self.output_projection.bias)
         # Adaptive capacity gate (only built when enabled).
         # At rest (adaptive_capacity=False) this is None and the encoder
         # behaves identically to the fixed-bpp design.
