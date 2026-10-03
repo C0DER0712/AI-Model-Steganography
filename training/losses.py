@@ -276,6 +276,7 @@ def _validate_loss_weights(weights: LossWeights) -> None:
         "payload": weights.payload,
         "distortion": weights.distortion,
         "detector": weights.detector,
+        "capacity": weights.capacity,
     }
     for name, value in values.items():
         if value < 0:

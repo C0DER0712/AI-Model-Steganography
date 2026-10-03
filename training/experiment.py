@@ -80,6 +80,8 @@ class ExperimentConfig:
     save_best_only: bool = False
     monitor: str | None = None
     monitor_mode: str = "min"
+    checkpoint_constraint_metric: str | None = None
+    checkpoint_constraint_minimum: float | None = None
     minimum_host_accuracy: float | None = None
     num_workers: int = 0
     # Curriculum learning: number of epochs over which alpha (classification
@@ -260,6 +262,8 @@ class SteganographyExperiment:
             save_best_only=cfg.save_best_only,
             monitor=cfg.monitor or ("val_loss" if val_loader is not None else "train_loss"),
             monitor_mode=cfg.monitor_mode,
+            checkpoint_constraint_metric=cfg.checkpoint_constraint_metric,
+            checkpoint_constraint_minimum=cfg.checkpoint_constraint_minimum,
             early_stopping_patience=cfg.early_stopping_patience,
             log_every_n_steps=cfg.log_every_n_steps,
             scheduler_interval=_scheduler_interval(cfg.scheduler),

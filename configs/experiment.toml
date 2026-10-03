@@ -231,7 +231,7 @@ dropout              = 0.5
 # Run with --dataset cifar10 (synthetic data has random labels -> classification
 # loss is meaningless on synthetic images).
 alpha = 1.0   # Host model accuracy preservation (requires --dataset cifar10)
-beta  = 1.0   # Payload recovery
+beta  = 2.0   # Give payload recovery more weight; monitor host accuracy constraint.
 gamma = 0.0   # Weight-representation distortion (add later)
 delta = 0.0   # Frozen detector evasion (add later)
 # Capacity maximisation weight (eta). Pushes learned gate → 1 (use more
@@ -245,10 +245,12 @@ eta   = 0.1   # Adaptive capacity maximisation
 # ---------------------------------------------------------------------------
 
 [training]
-max_epochs            = 200
+max_epochs            = 500
 batch_size            = 64
-monitor               = "val_host_accuracy"
+monitor               = "val_payload_accuracy"
 monitor_mode          = "max"
+checkpoint_constraint_metric = "val_host_accuracy"
+checkpoint_constraint_minimum = 0.90
 minimum_host_accuracy = 0.50
 # Raised from 1e-4 -> 2e-3. At the old rate, real (fixed-architecture)
 # learning was measurably happening but far too slowly to be practical —

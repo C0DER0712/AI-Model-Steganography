@@ -53,6 +53,8 @@ class TrainerConfig:
     save_best_only: bool = False
     monitor: str = "val_loss"
     monitor_mode: MonitorMode = "min"
+    checkpoint_constraint_metric: str | None = None
+    checkpoint_constraint_minimum: float | None = None
     early_stopping_patience: int | None = None
     log_every_n_steps: int = 1
     scheduler_interval: SchedulerInterval = "epoch"
@@ -221,10 +223,24 @@ class Trainer:
         self.optimizer.load_state_dict(checkpoint["optimizer"])
         if self.scheduler is not None and checkpoint.get("scheduler") is not None:
             self.scheduler.load_state_dict(checkpoint["scheduler"])
+            if (
+                hasattr(self.scheduler, "T_max")
+                and self.config.max_epochs > self.scheduler.T_max
+            ):
+                self.scheduler.T_max = self.config.max_epochs
         if checkpoint.get("scaler"):
             self.scaler.load_state_dict(checkpoint["scaler"])
 
         state = checkpoint.get("trainer_state", {})
+        saved_monitor = checkpoint.get("config", {}).get("monitor")
+        if saved_monitor != self.config.monitor:
+            # A different selection metric has a different scale/meaning;
+            # the previous best_metric cannot be compared to it.
+            state = {
+                **state,
+                "best_metric": None,
+                "epochs_without_improvement": 0,
+            }
         self.state = TrainerState(**state)
         self._best_model_state = {
             name: tensor.detach().cpu().clone()
@@ -301,7 +317,24 @@ class Trainer:
 
     def _update_checkpointing(self, epoch: int, metrics: Mapping[str, float]) -> None:
         monitor_value = metrics.get(self.config.monitor)
-        improved = monitor_value is not None and self._is_improved(monitor_value)
+        constraint_value = (
+            metrics.get(self.config.checkpoint_constraint_metric)
+            if self.config.checkpoint_constraint_metric is not None
+            else None
+        )
+        constraint_satisfied = (
+            self.config.checkpoint_constraint_metric is None
+            or (
+                constraint_value is not None
+                and self.config.checkpoint_constraint_minimum is not None
+                and constraint_value >= self.config.checkpoint_constraint_minimum
+            )
+        )
+        improved = (
+            monitor_value is not None
+            and constraint_satisfied
+            and self._is_improved(monitor_value)
+        )
 
         if improved:
             self._best_model_state = {
@@ -477,6 +510,13 @@ def _validate_config(config: TrainerConfig) -> None:
         raise ValueError("gradient_clip_norm must be positive when set.")
     if config.monitor_mode not in {"min", "max"}:
         raise ValueError("monitor_mode must be 'min' or 'max'.")
+    if (config.checkpoint_constraint_metric is None) != (
+        config.checkpoint_constraint_minimum is None
+    ):
+        raise ValueError(
+            "checkpoint_constraint_metric and checkpoint_constraint_minimum "
+            "must be configured together."
+        )
     if (
         config.early_stopping_patience is not None
         and config.early_stopping_patience <= 0

@@ -214,6 +214,8 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
                         help="Weight distortion loss weight γ. (default: 1.0)")
     parser.add_argument("--delta", type=float, default=None,
                         help="Detector evasion loss weight δ. (default: 1.0)")
+    parser.add_argument("--eta", type=float, default=None,
+                        help="Adaptive capacity-gate loss weight η. (default: config value)")
 
     # Data
     parser.add_argument(
@@ -348,6 +350,7 @@ def main(argv: list[str] | None = None) -> int:
         payload=_resolve(args.beta, loss_sec.get("beta"), 1.0),
         distortion=_resolve(args.gamma, loss_sec.get("gamma"), 1.0),
         detector=_resolve(args.delta, loss_sec.get("delta"), 1.0),
+        capacity=_resolve(args.eta, loss_sec.get("eta"), 0.0),
     )
     # Explicit confirmation of the ACTUALLY-resolved weights (as opposed to
     # what's on disk in the config file, which CLI flags override silently)
@@ -355,11 +358,12 @@ def main(argv: list[str] | None = None) -> int:
     # here has caused real confusion before.
     logger.info(
         "Resolved loss weights: alpha(classification)=%s beta(payload)=%s "
-        "gamma(distortion)=%s delta(detector)=%s",
+        "gamma(distortion)=%s delta(detector)=%s eta(capacity)=%s",
         loss_weights.classification,
         loss_weights.payload,
         loss_weights.distortion,
         loss_weights.detector,
+        loss_weights.capacity,
     )
 
     # ---- Build experiment config ----
@@ -392,6 +396,8 @@ def main(argv: list[str] | None = None) -> int:
         save_best_only=_resolve(None, train_sec.get("save_best_only"), False),
         monitor=train_sec.get("monitor"),
         monitor_mode=train_sec.get("monitor_mode", "min"),
+        checkpoint_constraint_metric=train_sec.get("checkpoint_constraint_metric"),
+        checkpoint_constraint_minimum=train_sec.get("checkpoint_constraint_minimum"),
         minimum_host_accuracy=train_sec.get("minimum_host_accuracy"),
     )
 
