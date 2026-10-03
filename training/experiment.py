@@ -78,6 +78,8 @@ class ExperimentConfig:
     loss_weights: LossWeights = field(default_factory=LossWeights)
     log_every_n_steps: int = 10
     save_best_only: bool = False
+    monitor: str | None = None
+    monitor_mode: str = "min"
     num_workers: int = 0
     # Curriculum learning: number of epochs over which alpha (classification
     # loss weight) is linearly ramped from 0 up to its configured target value.
@@ -236,8 +238,8 @@ class SteganographyExperiment:
             checkpoint_dir=str(self.output_dir / "checkpoints"),
             log_dir=str(self.output_dir / "tensorboard"),
             save_best_only=cfg.save_best_only,
-            monitor="val_loss" if val_loader is not None else "train_loss",
-            monitor_mode="min",
+            monitor=cfg.monitor or ("val_loss" if val_loader is not None else "train_loss"),
+            monitor_mode=cfg.monitor_mode,
             early_stopping_patience=cfg.early_stopping_patience,
             log_every_n_steps=cfg.log_every_n_steps,
             scheduler_interval=_scheduler_interval(cfg.scheduler),

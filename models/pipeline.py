@@ -98,6 +98,17 @@ class EmbeddingPipeline(nn.Module):
         )
         if cfg.host_model_checkpoint is not None:
             self._load_host_checkpoint(cfg.host_model_checkpoint)
+        elif (
+            cfg.host_model_name not in {"tiny", "tiny_bn"}
+            and
+            cfg.host_model_num_classes != 1000
+            and not cfg.train_host_model
+        ):
+            raise ValueError(
+                "A non-ImageNet host with a task-specific class count must be "
+                "initialized from a trained --host-checkpoint or trained with "
+                "train_host_model=True. Refusing to evaluate random classifier weights."
+            )
         self.encoder: WeightPayloadEncoder = build_encoder(cfg.encoder)
         self.decoder: DensePayloadDecoder = build_decoder(cfg.decoder)
         self.detector: DifferentiableDetector = DifferentiableDetector(cfg.detector)
@@ -228,6 +239,26 @@ class EmbeddingPipeline(nn.Module):
         num_weight_values = sum(record.values.numel() for record in weight_records)
         # original_repr is a single-channel float image (1, side, side).
         side = original_repr.shape[-1]
+        max_payload_bits = (
+            self.encoder.config.bits_per_pixel
+            * original_repr.shape[-2]
+            * original_repr.shape[-1]
+        )
+        if self.config.payload_bits > max_payload_bits:
+            raise ValueError(
+                f"Payload has {self.config.payload_bits:,} bits, but this host "
+                f"representation supports at most {max_payload_bits:,} bits "
+                f"with bits_per_pixel={self.encoder.config.bits_per_pixel}. "
+                "Increase bits_per_pixel or use a larger host model."
+            )
+        if self.encoder.grid_side > min(original_repr.shape[-2:]):
+            raise ValueError(
+                f"Payload grid is {self.encoder.grid_side}x{self.encoder.grid_side}, "
+                f"but the host representation is only {original_repr.shape[-2]}x"
+                f"{original_repr.shape[-1]}. The encoder would spatially downsample "
+                "payload cells and lose bits; increase bits_per_pixel or use a "
+                "larger host model."
+            )
         original_repr_batch = original_repr.unsqueeze(0).expand(num_replicas, -1, -1, -1)
 
         # ---- Encoder: produce modified representation ----

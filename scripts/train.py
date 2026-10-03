@@ -328,7 +328,9 @@ def main(argv: list[str] | None = None) -> int:
         host_model_name=_resolve(args.host_model, host_sec.get("name"), "resnet18"),
         host_model_num_classes=_resolve(args.num_classes, host_sec.get("num_classes"), default_num_classes),
         host_model_pretrained=_resolve(args.pretrained, host_sec.get("pretrained"), False),
-        host_model_checkpoint=host_sec.get("checkpoint"),
+        # Honor the CLI override as well as the config value.  Previously this
+        # passed host_sec directly, silently ignoring --host-checkpoint.
+        host_model_checkpoint=str(host_checkpoint) if host_checkpoint is not None else None,
         train_host_model=_resolve(args.train_host_model, host_sec.get("train_host_model"), False),
         payload_bits=payload_bits,
         payload_replicas=_resolve(args.payload_replicas, train_sec.get("payload_replicas"), 1),
@@ -388,6 +390,8 @@ def main(argv: list[str] | None = None) -> int:
         num_workers=_resolve(args.num_workers, data_sec.get("num_workers"), 0),
         log_every_n_steps=_resolve(None, train_sec.get("log_every_n_steps"), 10),
         save_best_only=_resolve(None, train_sec.get("save_best_only"), False),
+        monitor=train_sec.get("monitor"),
+        monitor_mode=train_sec.get("monitor_mode", "min"),
     )
 
     # ---- Build image datasets ----

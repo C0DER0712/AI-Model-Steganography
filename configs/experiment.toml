@@ -33,9 +33,9 @@ image_size = 224
 # Must be one of: "128KB", "256KB", "512KB", "1MB".
 # Start smaller (32KB not in the supported set, so use 128KB) while getting
 # a config running on a small GPU, then scale up once training is stable.
-payload_size = "256KB"  # 256KB = 2,097,152 bits. grid_side=1449 < image_side=1507
-# for MobileNetV2 (10 classes), so all bits embed uniquely — the geometric
-# ceiling before the encoder must downsample the payload grid and drop bits.
+payload_size = "1MB"  # 8,388,608 bits; at bpp=4 the grid is 1449x1449.
+# MobileNetV2's learnable-weight image is 1871x1871, so every payload cell
+# has a distinct host location. scripts/train.py validates this at runtime.
 
 # Number of synthetic training samples when no real dataset is provided.
 synthetic_samples = 512
@@ -75,7 +75,9 @@ num_classes = 10
 pretrained = true
 
 # Create this with scripts/pretrain_host.py before the embedding run.
-checkpoint = "/kaggle/input/models/cs23b2013/mobile-net-pretrained/pytorch/default/1/mobilenet_v2_cifar10.pt"
+# Set this to the CIFAR-10 fine-tuned checkpoint created by
+# scripts/pretrain_host.py. No machine-specific Kaggle path is assumed.
+checkpoint = "outputs/host_pretraining/mobilenet_v2_cifar10.pt"
 
 # Allow the host model to be fine-tuned alongside encoder/decoder.
 train_host_model = false
@@ -150,8 +152,8 @@ message_prep_layers  = 2
 # carries. 1 = original single-bit design. With reference_decoding=True the
 # 4 IEEE754 byte-channels of the residual can carry up to 4 independent bit
 # signals — bits_per_pixel=4 gives ~12.5% embedding rate vs 3.1% for bpp=1.
-# Start with bpp=2 for the first multi-bit experiment (lower risk of OOM and
-# cross-bit interference than bpp=4) then move to 4 once it validates.
+# Four independent bit channels are required to carry a 1MB payload in the
+# MobileNetV2 learnable-weight image without dropping spatial payload cells.
 # Must equal [decoder] bits_per_pixel exactly.
 bits_per_pixel       = 4
 # Adaptive capacity: the encoder learns WHICH pixels are safe to embed
@@ -245,6 +247,8 @@ eta   = 0.1   # Adaptive capacity maximisation
 [training]
 max_epochs            = 200
 batch_size            = 64
+monitor               = "val_host_accuracy"
+monitor_mode          = "max"
 # Raised from 1e-4 -> 2e-3. At the old rate, real (fixed-architecture)
 # learning was measurably happening but far too slowly to be practical —
 # ~1.36 percentage points of movement over 50 epochs. Since you're
@@ -306,7 +310,7 @@ early_stopping_patience = 50
 # give perfect payload recovery, so the encoder can freely shrink its
 # effective delta magnitude to satisfy the accuracy objective without
 # sacrificing payload BER. 0 = no curriculum (alpha fixed from epoch 1).
-alpha_warmup_epochs   = 300
+alpha_warmup_epochs   = 0
 
 # Curriculum: alpha linearly ramps 0 -> 1.0 over the first N epochs.
 # Phase 1 (epochs 1..N): embed aggressively, no accuracy pressure.

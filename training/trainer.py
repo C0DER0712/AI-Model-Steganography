@@ -114,6 +114,7 @@ class Trainer:
         self.checkpoint_dir.mkdir(parents=True, exist_ok=True)
         self.writer = writer or SummaryWriter(log_dir=str(Path(config.log_dir).expanduser()))
         self.state = TrainerState()
+        self._best_model_state: dict[str, torch.Tensor] | None = None
         self.scaler = torch.amp.GradScaler(
             "cuda",
             enabled=config.mixed_precision and self.device.type == "cuda",
@@ -145,6 +146,8 @@ class Trainer:
                 break
 
         self.writer.flush()
+        if self._best_model_state is not None:
+            self.model.load_state_dict(self._best_model_state)
         return history
 
     @torch.no_grad()
@@ -223,6 +226,10 @@ class Trainer:
 
         state = checkpoint.get("trainer_state", {})
         self.state = TrainerState(**state)
+        self._best_model_state = {
+            name: tensor.detach().cpu().clone()
+            for name, tensor in self.model.state_dict().items()
+        }
         return checkpoint
 
     def close(self) -> None:
@@ -297,6 +304,13 @@ class Trainer:
         improved = monitor_value is not None and self._is_improved(monitor_value)
 
         if improved:
+            self._best_model_state = {
+                name: tensor.detach().cpu().clone()
+                for name, tensor in self.model.state_dict().items()
+            }
+            self.save_checkpoint(
+                self.checkpoint_dir / self.config.best_checkpoint_name, metrics
+            )
             self.state = TrainerState(
                 epoch=epoch + 1,
                 global_step=self.state.global_step,
@@ -304,7 +318,6 @@ class Trainer:
                 epochs_without_improvement=0,
                 stopped_early=False,
             )
-            self.save_checkpoint(self.checkpoint_dir / self.config.best_checkpoint_name, metrics)
         else:
             self.state = TrainerState(
                 epoch=epoch + 1,

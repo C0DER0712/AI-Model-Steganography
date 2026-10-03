@@ -43,6 +43,10 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--epochs", type=int, default=20)
     parser.add_argument("--batch-size", type=int, default=64)
     parser.add_argument("--lr", type=float, default=1e-3)
+    parser.add_argument(
+        "--image-size", type=int, default=224,
+        help="Training and evaluation image size (must match embedding config).",
+    )
     parser.add_argument("--num-workers", type=int, default=2)
     parser.add_argument("--device", default="auto")
     parser.add_argument("--seed", type=int, default=42)
@@ -78,7 +82,9 @@ def main() -> int:
     set_seed(args.seed)
     device = _resolve_device(args.device)
     transform = transforms.Compose([
-        transforms.Resize((224, 224)), transforms.ToTensor(), IMAGENET_NORMALIZE,
+        transforms.Resize((args.image_size, args.image_size)),
+        transforms.ToTensor(),
+        IMAGENET_NORMALIZE,
     ])
     data_root = _cifar_root(args.data_root)
     train_ds = CIFAR10(str(data_root), train=True, download=args.download, transform=transform)
