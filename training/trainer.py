@@ -233,6 +233,7 @@ class Trainer:
 
         state = checkpoint.get("trainer_state", {})
         saved_monitor = checkpoint.get("config", {}).get("monitor")
+        was_stopped_early = bool(state.get("stopped_early", False))
         if saved_monitor != self.config.monitor:
             # A different selection metric has a different scale/meaning;
             # the previous best_metric cannot be compared to it.
@@ -241,6 +242,12 @@ class Trainer:
                 "best_metric": None,
                 "epochs_without_improvement": 0,
             }
+        elif was_stopped_early:
+            # `--resume` explicitly requests more training. A checkpoint saved
+            # at an early-stop boundary must not cause the resumed run to stop
+            # again after its first epoch.
+            state = {**state, "epochs_without_improvement": 0}
+        state = {**state, "stopped_early": False}
         self.state = TrainerState(**state)
         self._best_model_state = {
             name: tensor.detach().cpu().clone()
