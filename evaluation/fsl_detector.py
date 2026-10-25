@@ -27,14 +27,15 @@ Key classes
     Produces :class:`~evaluation.detector.DetectionResult` objects.
 
 Triplet loss
-    L(A, P, N) = max( d(A, P) - d(A, N) + margin, 0 )
-    where d is Euclidean distance and the default margin is 0.5.
+    L(A, P, N) = max( ||A-P||² - ||A-N||² + margin, 0 )
+    matching the squared-L2 Siamese loss in the Model X-Ray reference code.
 """
 
 from __future__ import annotations
 
 import logging
 import random
+from itertools import combinations
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Dict, List, Optional, Sequence, Tuple, Union
@@ -86,6 +87,10 @@ class FSLConfig:
     classifier: str = "centroid"   # "centroid" | "1nn"
     device: str = "auto"
     seed: int = 42
+    stop_when_loss_in_range: bool = True
+    loss_threshold_lower: float = 0.1
+    loss_threshold_upper: float = 0.4
+    exhaustive_triplets: bool = False
 
 
 # ---------------------------------------------------------------------------
@@ -185,11 +190,14 @@ class TripletDataset(Dataset):
         fsl_dataset: FSLDataset,
         num_triplets: int = 200,
         seed: int = 42,
+        exhaustive: bool = False,
     ) -> None:
         self.fsl_dataset = fsl_dataset
         self.num_triplets = num_triplets
+        self.exhaustive = exhaustive
         self.rng = random.Random(seed)
         self._triplets: List[Tuple[int, int, int]] = []
+        self._exhaustive_classes: Optional[Tuple[List[int], List[int]]] = None
         self.resample()
 
     def resample(self) -> None:
@@ -203,6 +211,26 @@ class TripletDataset(Dataset):
                 "FSLDataset must contain at least one benign and one malicious "
                 "sample to form triplets."
             )
+
+        if self.exhaustive:
+            # Paper implementation draws at most 10 examples per class, then
+            # enumerates every class-internal pair against every opposite-class
+            # negative (both anchor-label directions).
+            if self._exhaustive_classes is None:
+                self._exhaustive_classes = (
+                    self.rng.sample(benign, min(10, len(benign))),
+                    self.rng.sample(malicious, min(10, len(malicious))),
+                )
+            benign, malicious = self._exhaustive_classes
+            triplets = [
+                (anchor, positive, negative)
+                for same_class, other_class in ((benign, malicious), (malicious, benign))
+                for anchor, positive in combinations(same_class, 2)
+                for negative in other_class
+            ]
+            self.rng.shuffle(triplets)
+            self._triplets = triplets
+            return
 
         triplets: List[Tuple[int, int, int]] = []
         for _ in range(self.num_triplets):
@@ -252,7 +280,7 @@ def triplet_loss(
 ) -> Tensor:
     """Compute the triplet loss over a batch.
 
-    L(A, P, N) = mean( max( ‖A-P‖₂ - ‖A-N‖₂ + margin, 0 ) )
+    L(A, P, N) = mean( max( ||A-P||² - ||A-N||² + margin, 0 ) )
 
     Args:
         anchor: Embeddings of anchor samples ``(B, D)``.
@@ -263,8 +291,9 @@ def triplet_loss(
     Returns:
         Scalar loss tensor.
     """
-    d_ap = torch.norm(anchor - positive, p=2, dim=1)
-    d_an = torch.norm(anchor - negative, p=2, dim=1)
+    # Model X-Ray's reference Siamese implementation uses squared L2.
+    d_ap = torch.sum((anchor - positive) ** 2, dim=1)
+    d_an = torch.sum((anchor - negative) ** 2, dim=1)
     loss = F.relu(d_ap - d_an + margin)
     return loss.mean()
 
@@ -489,6 +518,9 @@ class FSLDetector:
 
         self._classifier: Optional[Union[NearestCentroidClassifier, NNClassifier]] = None
         self._is_fitted = False
+        self._input_mean = 0.0
+        self._input_std = 1.0
+        self._normalization_enabled = False
 
     # ------------------------------------------------------------------
     # Fit
@@ -513,7 +545,22 @@ class FSLDetector:
         torch.manual_seed(cfg.seed)
 
         fsl_ds = FSLDataset(benign_gf_images, malicious_gf_images, imsize=cfg.imsize)
-        triplet_ds = TripletDataset(fsl_ds, num_triplets=cfg.num_triplets_per_epoch, seed=cfg.seed)
+        # Match the paper: scale byte images to [0, 1], then adapt a
+        # training-set Normalization layer (one grayscale channel).
+        pixel_count = sum(int(image.size) for image in fsl_ds._images)
+        pixel_sum = sum(float(image.astype(np.float64).sum()) for image in fsl_ds._images)
+        pixel_sq_sum = sum(float(np.square(image.astype(np.float64)).sum())
+                           for image in fsl_ds._images)
+        self._input_mean = pixel_sum / (255.0 * pixel_count)
+        variance = pixel_sq_sum / (255.0 * 255.0 * pixel_count) - self._input_mean ** 2
+        self._input_std = max(variance, 1e-7) ** 0.5
+        self._normalization_enabled = True
+        triplet_ds = TripletDataset(
+            fsl_ds,
+            num_triplets=cfg.num_triplets_per_epoch,
+            seed=cfg.seed,
+            exhaustive=cfg.exhaustive_triplets,
+        )
 
         optimizer = torch.optim.Adam(self.srnet.parameters(), lr=cfg.learning_rate)
         epoch_losses: List[float] = []
@@ -537,9 +584,9 @@ class FSLDetector:
             epoch_loss = 0.0
             num_batches = 0
             for anchors, positives, negatives in loader:
-                anchors = anchors.to(self.device)
-                positives = positives.to(self.device)
-                negatives = negatives.to(self.device)
+                anchors = self._normalize_input(anchors.to(self.device))
+                positives = self._normalize_input(positives.to(self.device))
+                negatives = self._normalize_input(negatives.to(self.device))
 
                 emb_a = self.srnet.embed(anchors)
                 emb_p = self.srnet.embed(positives)
@@ -559,6 +606,14 @@ class FSLDetector:
 
             if epoch % max(1, cfg.num_epochs // 10) == 0 or epoch == cfg.num_epochs:
                 logger.info("  Epoch %d/%d  triplet_loss=%.4f", epoch, cfg.num_epochs, mean_loss)
+
+            if (cfg.stop_when_loss_in_range
+                    and cfg.loss_threshold_lower <= mean_loss <= cfg.loss_threshold_upper):
+                logger.info(
+                    "Stopping at epoch %d: triplet loss %.4f is within [%.3f, %.3f].",
+                    epoch, mean_loss, cfg.loss_threshold_lower, cfg.loss_threshold_upper,
+                )
+                break
 
         # ---- Fit classifier on training embeddings ----
         self.srnet.eval()
@@ -586,6 +641,7 @@ class FSLDetector:
             raise RuntimeError("FSLDetector must be fitted before predicting.")
 
         tensor = gf_image_to_tensor(gf_image).unsqueeze(0).to(self.device)  # (1, 1, H, W)
+        tensor = self._normalize_input(tensor)
         self.srnet.eval()
         with torch.no_grad():
             emb = self.srnet.embed(tensor).squeeze(0)  # (D,)
@@ -641,6 +697,10 @@ class FSLDetector:
         out = Path(output_dir)
         out.mkdir(parents=True, exist_ok=True)
         self.srnet.save(out / "srnet.pt")
+        torch.save(
+            {"mean": self._input_mean, "std": self._input_std},
+            out / "input_normalization.pt",
+        )
         if hasattr(self._classifier, "save"):
             self._classifier.save(out / "classifier.pt")
         else:
@@ -678,6 +738,15 @@ class FSLDetector:
         srnet = SRNetDetector.load(srnet_path, map_location=map_location)
         cfg = config or FSLConfig()
         detector = cls(config=cfg, srnet=srnet)
+        normalization_path = Path(classifier_path).parent / "input_normalization.pt"
+        if normalization_path.exists():
+            try:
+                norm = torch.load(normalization_path, map_location="cpu", weights_only=True)
+            except TypeError:
+                norm = torch.load(normalization_path, map_location="cpu")
+            detector._input_mean = float(norm["mean"])
+            detector._input_std = max(float(norm["std"]), 1e-7)
+            detector._normalization_enabled = True
 
         # Classifier checkpoints are generated locally by ``save``.  Explicitly
         # disable PyTorch's safe weights-only mode for version-independent
@@ -714,7 +783,7 @@ class FSLDetector:
         loader = DataLoader(fsl_ds, batch_size=16, shuffle=False)
         with torch.no_grad():
             for imgs, labels in loader:
-                imgs = imgs.to(self.device)
+                imgs = self._normalize_input(imgs.to(self.device))
                 embs = self.srnet.embed(imgs)
                 all_embeddings.append(embs.cpu())
                 all_labels.extend(labels.tolist())
@@ -730,6 +799,12 @@ class FSLDetector:
 
         clf.fit(embeddings, all_labels)
         self._classifier = clf
+
+    def _normalize_input(self, images: Tensor) -> Tensor:
+        """Scale byte GF images and standardize using training-set statistics."""
+        if not self._normalization_enabled:
+            return images.float()  # compatibility with pre-normalization checkpoints
+        return (images.float() / 255.0 - self._input_mean) / self._input_std
 
     @property
     def is_fitted(self) -> bool:

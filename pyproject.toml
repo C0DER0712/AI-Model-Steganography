@@ -31,6 +31,7 @@ dev = [
 [project.scripts]
 stego-train    = "scripts.train:main"
 stego-evaluate = "scripts.evaluate:main"
+stego-train-detector = "scripts.train_detector:main"
 
 [tool.setuptools]
 packages = ["models", "training", "evaluation", "utils", "scripts"]

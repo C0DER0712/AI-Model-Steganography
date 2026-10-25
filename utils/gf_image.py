@@ -1,9 +1,8 @@
 """Grayscale-Fourpart (GF) image utilities for Model X-Ray detection.
 
 The Model X-Ray paper represents AI model weights as **Grayscale-Fourpart
-(GF)** images: the four IEEE754 byte channels produced by
-:func:`~utils.representation.weights_to_channels` are tiled into a single
-``(2S × 2S)`` grayscale image in a 2×2 quad layout::
+(GF)** images: each float32 parameter's four IEEE754 bytes are arranged into
+a 2×2 micro-tile, matching the Model X-Ray reference preprocessing::
 
     ┌─────┬─────┐
     │ p0  │ p1  │   p0 = bits[31:24]  (sign + exponent MSB)
@@ -24,8 +23,7 @@ gf_image_to_channels(gf_image)
     ``(2S, 2S)`` uint8 GF image → ``(4, S, S)`` uint8 channels (inverse).
 
 resize_gf_image(gf_image, size)
-    Resize a GF image to ``(size, size)`` pixels (nearest-neighbour to
-    preserve byte values).
+    Resize a GF image to ``(size, size)`` pixels using Pillow BOX resampling.
 
 weights_to_gf_image(weights, imsize)
     Convenience: flat weight tensor → GF image of ``(imsize, imsize)``
@@ -40,7 +38,6 @@ from __future__ import annotations
 
 from typing import Union
 
-import cv2
 import numpy as np
 import torch
 
@@ -55,9 +52,9 @@ from utils.representation import weights_to_channels
 def channels_to_gf_image(channels: np.ndarray) -> np.ndarray:
     """Convert four byte channels to a single Grayscale-Fourpart image.
 
-    The four ``(S, S)`` channel planes are tiled into a ``(2S, 2S)``
-    single-channel image using the canonical 2×2 quad layout described in
-    the Model X-Ray paper.
+    Each value in the four ``(S, S)`` byte planes becomes one 2×2 pixel tile.
+    This produces a ``(2S, 2S)`` image and keeps bytes of each parameter
+    spatially adjacent, matching the Model X-Ray reference preprocessing.
 
     Args:
         channels: ``uint8``-compatible array with shape ``(4, S, S)``.
@@ -81,10 +78,10 @@ def channels_to_gf_image(channels: np.ndarray) -> np.ndarray:
         )
     s = h
     gf = np.empty((2 * s, 2 * s), dtype=np.uint8)
-    gf[:s, :s] = channels[0]   # p0 — top-left
-    gf[:s, s:] = channels[1]   # p1 — top-right
-    gf[s:, :s] = channels[2]   # p2 — bottom-left
-    gf[s:, s:] = channels[3]   # p3 — bottom-right
+    gf[0::2, 0::2] = channels[0]   # p0 — top-left of each parameter tile
+    gf[0::2, 1::2] = channels[1]   # p1 — top-right
+    gf[1::2, 0::2] = channels[2]   # p2 — bottom-left
+    gf[1::2, 1::2] = channels[3]   # p3 — bottom-right
     return gf
 
 
@@ -117,10 +114,10 @@ def gf_image_to_channels(gf_image: np.ndarray) -> np.ndarray:
         )
     s = h // 2
     channels = np.empty((4, s, s), dtype=np.uint8)
-    channels[0] = gf_image[:s, :s]   # p0
-    channels[1] = gf_image[:s, s:]   # p1
-    channels[2] = gf_image[s:, :s]   # p2
-    channels[3] = gf_image[s:, s:]   # p3
+    channels[0] = gf_image[0::2, 0::2]   # p0
+    channels[1] = gf_image[0::2, 1::2]   # p1
+    channels[2] = gf_image[1::2, 0::2]   # p2
+    channels[3] = gf_image[1::2, 1::2]   # p3
     return channels
 
 
@@ -130,11 +127,10 @@ def gf_image_to_channels(gf_image: np.ndarray) -> np.ndarray:
 
 
 def resize_gf_image(gf_image: np.ndarray, size: int) -> np.ndarray:
-    """Resize a GF image to ``(size, size)`` using nearest-neighbour interpolation.
+    """Resize a GF image with Pillow BOX resampling, matching Model X-Ray.
 
-    Nearest-neighbour is preferred over bilinear because the GF image encodes
-    raw byte values — sub-pixel blending would corrupt the bit-level statistics
-    that steganalysis features rely on.
+    BOX area resampling preserves local byte statistics when a large weight
+    image is reduced to SRNet's fixed input size.
 
     Args:
         gf_image: ``uint8``-compatible 2-D array.
@@ -146,10 +142,13 @@ def resize_gf_image(gf_image: np.ndarray, size: int) -> np.ndarray:
     gf_image = np.asarray(gf_image, dtype=np.uint8)
     if gf_image.shape == (size, size):
         return gf_image
-    resized = cv2.resize(
-        gf_image, (size, size), interpolation=cv2.INTER_NEAREST
+    from PIL import Image
+
+    resampling = getattr(Image, "Resampling", Image).BOX
+    return np.asarray(
+        Image.fromarray(gf_image).resize((size, size), resample=resampling),
+        dtype=np.uint8,
     )
-    return resized.astype(np.uint8)
 
 
 # ---------------------------------------------------------------------------
