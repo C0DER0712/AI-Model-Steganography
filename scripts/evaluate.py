@@ -92,6 +92,10 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
              "If omitted, evaluates the untrained baseline.",
     )
     parser.add_argument(
+        "--config", type=Path, default=None,
+        help="Training TOML config used to construct the matching encoder/decoder architecture.",
+    )
+    parser.add_argument(
         "--host-model",
         choices=["resnet18", "resnet50", "mobilenet_v2", "vgg16"],
         default="resnet18",
@@ -196,13 +200,24 @@ def main(argv: list[str] | None = None) -> int:
     saved_pipeline_cfg = (
         ckpt.get("config", {}).get("pipeline", {}) if isinstance(ckpt, dict) else {}
     )
-    pipeline_cfg = _pipeline_config_for_evaluation(
-        saved_pipeline_cfg,
-        host_model=args.host_model,
-        num_classes=args.num_classes,
-        host_checkpoint=args.host_checkpoint,
-        payload_bits=payload_bits,
-    )
+    if args.config is not None:
+        experiment_config = load_config(args.config)
+        pipeline_cfg = _pipeline_config_from_toml(
+            experiment_config,
+            host_model=args.host_model,
+            num_classes=args.num_classes,
+            host_checkpoint=args.host_checkpoint,
+            payload_bits=payload_bits,
+        )
+        logger.info("Constructed evaluation architecture from %s", args.config)
+    else:
+        pipeline_cfg = _pipeline_config_for_evaluation(
+            saved_pipeline_cfg,
+            host_model=args.host_model,
+            num_classes=args.num_classes,
+            host_checkpoint=args.host_checkpoint,
+            payload_bits=payload_bits,
+        )
     if saved_pipeline_cfg and saved_pipeline_cfg.get("payload_bits") not in (None, payload_bits):
         raise ValueError(
             f"Requested {payload_size_str} ({payload_bits:,} bits), but the checkpoint "
@@ -473,6 +488,68 @@ def _pipeline_config_for_evaluation(
         "detector": detector,
     })
     return PipelineConfig(**arguments)
+
+
+def _pipeline_config_from_toml(
+    config: dict,
+    *,
+    host_model: str,
+    num_classes: int,
+    host_checkpoint: Path | None,
+    payload_bits: int,
+) -> PipelineConfig:
+    """Construct an evaluation pipeline from the same TOML as training."""
+    host = config.get("host_model", {})
+    encoder_values = config.get("encoder", {})
+    decoder_values = config.get("decoder", {})
+    detector_values = config.get("detector", {})
+    training = config.get("training", {})
+    pipeline_values = config.get("pipeline", {})
+
+    bpp = encoder_values.get(
+        "bits_per_pixel", decoder_values.get("bits_per_pixel", 1)
+    )
+    encoder = EncoderConfig(
+        payload_dim=payload_bits,
+        base_channels=encoder_values.get("base_channels", 64),
+        num_residual_blocks=encoder_values.get("num_residual_blocks", 4),
+        message_channels=encoder_values.get("message_channels", 32),
+        message_prep_layers=encoder_values.get("message_prep_layers", 2),
+        attention_reduction=encoder_values.get("attention_reduction", 8),
+        max_delta=encoder_values.get("max_delta", 0.05),
+        gradient_checkpointing=encoder_values.get("gradient_checkpointing", False),
+        bits_per_pixel=bpp,
+        adaptive_capacity=encoder_values.get("adaptive_capacity", False),
+    )
+    decoder = DecoderConfig(
+        base_channels=decoder_values.get("base_channels", 64),
+        num_residual_blocks=decoder_values.get("num_residual_blocks", 4),
+        attention_reduction=decoder_values.get("attention_reduction", 8),
+        gradient_checkpointing=decoder_values.get("gradient_checkpointing", False),
+        bits_per_pixel=bpp,
+    )
+    detector = DifferentiableDetectorConfig(
+        **{
+            field.name: detector_values[field.name]
+            for field in fields(DifferentiableDetectorConfig)
+            if field.name in detector_values
+        }
+    )
+    return PipelineConfig(
+        host_model_name=host_model,
+        host_model_num_classes=num_classes,
+        host_model_pretrained=False,
+        host_model_checkpoint=str(host_checkpoint) if host_checkpoint else None,
+        train_host_model=host.get("train_host_model", False),
+        encoder=encoder,
+        decoder=decoder,
+        detector=detector,
+        payload_bits=payload_bits,
+        payload_replicas=training.get("payload_replicas", 1),
+        run_classification=True,
+        run_detector=False,
+        reference_decoding=pipeline_values.get("reference_decoding", True),
+    )
 
 
 if __name__ == "__main__":
