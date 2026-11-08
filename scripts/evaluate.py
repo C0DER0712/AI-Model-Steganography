@@ -305,7 +305,7 @@ def main(argv: list[str] | None = None) -> int:
                 )
             roundtrip_repr = normalized_flat.reshape(1, 1, reference_side, reference_side).to(device)
             roundtrip_decoded = pipeline.decode(
-                roundtrip_repr.unsqueeze(0), original_repr, payload_bits
+                roundtrip_repr, original_repr, payload_bits
             )
             decoded = roundtrip_decoded
             modified_weight_list.append(roundtrip_flat.cpu())
