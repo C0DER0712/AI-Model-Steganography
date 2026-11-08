@@ -46,6 +46,7 @@ import argparse
 import io
 import json
 import logging
+import re
 import sys
 from dataclasses import fields
 from pathlib import Path
@@ -211,8 +212,14 @@ def main(argv: list[str] | None = None) -> int:
         )
         logger.info("Constructed evaluation architecture from %s", args.config)
     else:
+        if not saved_pipeline_cfg.get("encoder"):
+            logger.info(
+                "Checkpoint has no saved PipelineConfig; inferring encoder/decoder "
+                "structure from its tensor shapes."
+            )
         pipeline_cfg = _pipeline_config_for_evaluation(
             saved_pipeline_cfg,
+            state_dict=(ckpt.get("model", ckpt) if isinstance(ckpt, dict) else None),
             host_model=args.host_model,
             num_classes=args.num_classes,
             host_checkpoint=args.host_checkpoint,
@@ -451,6 +458,7 @@ def _resolve_device(device: str) -> torch.device:
 def _pipeline_config_for_evaluation(
     saved_config: dict,
     *,
+    state_dict: dict | None,
     host_model: str,
     num_classes: int,
     host_checkpoint: Path | None,
@@ -464,11 +472,19 @@ def _pipeline_config_for_evaluation(
         return config_type(**arguments)
 
     saved = saved_config if isinstance(saved_config, dict) else {}
-    encoder_values = dict(saved.get("encoder") or {})
-    decoder_values = dict(saved.get("decoder") or {})
+    inferred_encoder, inferred_decoder = _infer_encoder_decoder_config(state_dict or {})
+    encoder_values = inferred_encoder
+    encoder_values.update(saved.get("encoder") or {})
+    decoder_values = inferred_decoder
+    decoder_values.update(saved.get("decoder") or {})
     detector_values = dict(saved.get("detector") or {})
     encoder = make_config(EncoderConfig, encoder_values, payload_dim=payload_bits)
     decoder = make_config(DecoderConfig, decoder_values)
+    if encoder.bits_per_pixel != decoder.bits_per_pixel:
+        raise ValueError(
+            "Checkpoint/config disagrees on bits_per_pixel: "
+            f"encoder={encoder.bits_per_pixel}, decoder={decoder.bits_per_pixel}."
+        )
     detector = make_config(DifferentiableDetectorConfig, detector_values)
 
     pipeline_fields = {field.name for field in fields(PipelineConfig)}
@@ -488,6 +504,68 @@ def _pipeline_config_for_evaluation(
         "detector": detector,
     })
     return PipelineConfig(**arguments)
+
+
+def _infer_encoder_decoder_config(state: dict) -> tuple[dict, dict]:
+    """Infer structural settings from a model state dict when metadata is absent.
+
+    Trainer checkpoints currently store optimizer/trainer metadata but not the
+    experiment's PipelineConfig. Parameter shapes provide the required model
+    widths, block counts, payload bits-per-location, and adaptive-gate setting.
+    """
+    if not state:
+        return {}, {}
+
+    def shape(key: str) -> tuple[int, ...] | None:
+        value = state.get(key)
+        return tuple(value.shape) if isinstance(value, torch.Tensor) else None
+
+    def block_count(prefix: str) -> int:
+        indexes = [
+            int(match.group(1))
+            for key in state
+            if (match := re.match(rf"{re.escape(prefix)}\.blocks\.(\d+)\.conv1\.conv\.weight$", key))
+        ]
+        return max(indexes) + 1 if indexes else 4
+
+    def attention_reduction(prefix: str, key_suffix: str) -> int:
+        weight_shape = shape(f"{prefix}.blocks.0.{key_suffix}.weight")
+        stem_shape = shape(f"{prefix}.stem.conv.weight")
+        if weight_shape and stem_shape and weight_shape[0] > 0:
+            return max(1, stem_shape[0] // weight_shape[0])
+        return 8
+
+    encoder_stem = shape("encoder.stem.conv.weight")
+    message_first = shape("encoder.message_prep.net.0.conv.weight")
+    output_projection = shape("encoder.output_projection.weight")
+    message_layers = [
+        int(match.group(1))
+        for key in state
+        if (match := re.match(r"encoder\.message_prep\.net\.(\d+)\.conv\.weight$", key))
+    ]
+    encoder = {
+        "input_channels": encoder_stem[1] if encoder_stem else 1,
+        "output_channels": output_projection[0] if output_projection else 1,
+        "base_channels": encoder_stem[0] if encoder_stem else 64,
+        "num_residual_blocks": block_count("encoder"),
+        "message_channels": message_first[0] if message_first else 32,
+        "message_prep_layers": max(message_layers) + 1 if message_layers else 2,
+        "attention_reduction": attention_reduction("encoder", "attention.channel_reduce"),
+        "bits_per_pixel": message_first[1] if message_first else 1,
+        "adaptive_capacity": any(key.startswith("encoder.capacity_gate.") for key in state),
+        "max_delta": 0.05,
+    }
+
+    decoder_stem = shape("decoder.stem.conv.weight")
+    projection = shape("decoder.logit_projection.weight")
+    decoder = {
+        "input_channels": decoder_stem[1] if decoder_stem else 1,
+        "base_channels": decoder_stem[0] if decoder_stem else 64,
+        "num_residual_blocks": block_count("decoder"),
+        "attention_reduction": attention_reduction("decoder", "attention.reduce"),
+        "bits_per_pixel": projection[0] if projection else 1,
+    }
+    return encoder, decoder
 
 
 def _pipeline_config_from_toml(
