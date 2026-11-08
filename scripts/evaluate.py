@@ -76,7 +76,7 @@ from utils.logging import configure_logging
 from utils.payload import SUPPORTED_PAYLOAD_SIZES, generate_payload, payload_to_tensor
 from utils.seed import set_seed
 from utils.weights import extract_parameters, flatten_weights, load_modified_weights, restore_weights
-from utils.representation import weights_to_channels
+from utils.representation import weights_to_float_image, weights_to_channels
 
 
 def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
