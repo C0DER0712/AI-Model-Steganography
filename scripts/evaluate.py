@@ -126,6 +126,10 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         help="Optional trained Model X-Ray FSL classifier/centroid checkpoint.",
     )
     parser.add_argument(
+        "--detector-image-size", type=int, default=256,
+        help="GF image side used by the trained detector (train_detector.py defaults to 256).",
+    )
+    parser.add_argument(
         "--dataset",
         choices=["synthetic", "cifar10"],
         default="synthetic",
@@ -133,6 +137,10 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
              "accuracy-drop entirely (no real images available). 'cifar10' "
              "evaluates top-1/top-5 accuracy drop on the real CIFAR-10 test "
              "split. (default: synthetic)",
+    )
+    parser.add_argument(
+        "--image-size", type=int, default=None,
+        help="Host input image side; defaults to the training TOML value or 224.",
     )
     parser.add_argument(
         "--data-root",
@@ -201,6 +209,7 @@ def main(argv: list[str] | None = None) -> int:
     saved_pipeline_cfg = (
         ckpt.get("config", {}).get("pipeline", {}) if isinstance(ckpt, dict) else {}
     )
+    experiment_config = None
     if args.config is not None:
         experiment_config = load_config(args.config)
         pipeline_cfg = _pipeline_config_from_toml(
@@ -346,6 +355,7 @@ def main(argv: list[str] | None = None) -> int:
         srnet_weights_path=args.detector_srnet,
         centroid_path=args.detector_classifier,
         device=args.device,
+        image_size=args.detector_image_size,
     )
     try:
         det_metrics = evaluate_detector_from_weights(
@@ -375,7 +385,11 @@ def main(argv: list[str] | None = None) -> int:
                 args.num_classes,
             )
         logger.info("Evaluating accuracy drop on the real CIFAR-10 test set…")
-        image_size = 224 if args.host_model in {"mobilenet_v2", "vgg16"} else 32
+        image_size = args.image_size or (
+            experiment_config.get("data", {}).get("image_size", 224)
+            if experiment_config is not None
+            else 224
+        )
         transform_ops = []
         if image_size != 32:
             transform_ops.append(transforms.Resize((image_size, image_size)))
