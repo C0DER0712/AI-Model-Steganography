@@ -143,8 +143,10 @@ def state_dict_to_gf(state_dict: Mapping[str, Any], *, imsize: int) -> np.ndarra
     """Convert floating state-dict tensors to the paper's resized GF image."""
     tensors = [
         value.detach().cpu().float().reshape(-1)
-        for value in state_dict.values()
-        if isinstance(value, torch.Tensor) and value.is_floating_point()
+        for name, value in state_dict.items()
+        if isinstance(value, torch.Tensor)
+        and value.is_floating_point()
+        and not name.endswith(("running_mean", "running_var"))
     ]
     if not tensors:
         raise ValueError("Checkpoint has no floating-point tensors for GF conversion")

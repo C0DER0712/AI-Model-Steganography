@@ -13,7 +13,7 @@ from dataclasses import dataclass
 import torch
 from torch import nn
 
-from utils.weights import extract_weights, flatten_weights
+from utils.weights import extract_parameters, flatten_weights
 
 
 @dataclass(frozen=True)
@@ -92,7 +92,7 @@ def compute_capacity(
     if payload_bits < 0:
         raise ValueError("payload_bits must be non-negative.")
 
-    weight_records = extract_weights(model)
+    weight_records = extract_parameters(model)
     flat = flatten_weights(weight_records)
     num_params = flat.numel()
     total_bits = num_params * 32  # float32: 32 bits per parameter
@@ -136,7 +136,7 @@ def max_payload_bits(model: nn.Module, target_ber: float = 0.01) -> int:
     if not 0.0 <= target_ber < 1.0:
         raise ValueError("target_ber must be in [0, 1).")
 
-    weight_records = extract_weights(model)
+    weight_records = extract_parameters(model)
     flat = flatten_weights(weight_records)
     total_bits = flat.numel() * 32
     # Shannon capacity: H(BER) corrected channel capacity

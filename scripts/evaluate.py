@@ -43,6 +43,7 @@ Include real accuracy-drop metrics on CIFAR-10's held-out test set:
 from __future__ import annotations
 
 import argparse
+import io
 import json
 import logging
 import sys
@@ -70,7 +71,7 @@ from utils.config import load_config
 from utils.logging import configure_logging
 from utils.payload import SUPPORTED_PAYLOAD_SIZES, generate_payload, payload_to_tensor
 from utils.seed import set_seed
-from utils.weights import extract_weights, flatten_weights, load_modified_weights, restore_weights
+from utils.weights import extract_parameters, flatten_weights, load_modified_weights, restore_weights
 from utils.representation import weights_to_channels
 
 
@@ -103,6 +104,18 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         default=1000,
         help="Number of host model output classes. Set to 10 when using "
              "--dataset cifar10.",
+    )
+    parser.add_argument(
+        "--host-checkpoint", type=Path, default=None,
+        help="Trained host-model checkpoint (required for task-specific class heads).",
+    )
+    parser.add_argument(
+        "--detector-srnet", type=Path, default=None,
+        help="Optional trained Model X-Ray SRNet checkpoint.",
+    )
+    parser.add_argument(
+        "--detector-classifier", type=Path, default=None,
+        help="Optional trained Model X-Ray FSL classifier/centroid checkpoint.",
     )
     parser.add_argument(
         "--dataset",
@@ -176,6 +189,7 @@ def main(argv: list[str] | None = None) -> int:
         host_model_name=args.host_model,
         host_model_num_classes=args.num_classes,
         host_model_pretrained=False,
+        host_model_checkpoint=(str(args.host_checkpoint) if args.host_checkpoint else None),
         payload_bits=payload_bits,
     )
     pipeline = EmbeddingPipeline(pipeline_cfg)
@@ -201,8 +215,9 @@ def main(argv: list[str] | None = None) -> int:
     payload_bits_list: list[torch.Tensor] = []
     decoded_bits_list: list[torch.Tensor] = []
 
-    weight_records = extract_weights(pipeline.host_model.model)
+    weight_records = extract_parameters(pipeline.host_model.model)
     flat_weights_cpu = flatten_weights(weight_records)
+    _, norm_stats = weights_to_float_image(flat_weights_cpu)
 
     with torch.no_grad():
         for i in range(args.num_samples):
@@ -210,25 +225,54 @@ def main(argv: list[str] | None = None) -> int:
             bits = payload_to_tensor(payload).to(device=device, dtype=torch.float32)
 
             modified_repr, original_repr = pipeline.encode(bits)
-            decoded = pipeline.decode(modified_repr, payload_bits)
-
             original_weight_list.append(flat_weights_cpu.clone())
 
             # Reconstruct flat modified weights for detector evaluation.
             # The representation is now a single-channel float image in
             # normalised [-1, 1] space; invert with the host model's stats.
-            from utils.representation import (
-                weights_to_float_image,
-                float_image_to_weights,
-            )
-            _, stats = weights_to_float_image(flat_weights_cpu)
+            from utils.representation import float_image_to_weights
             modified_flat = float_image_to_weights(
                 modified_repr[0].detach().cpu(),
-                mean=stats.mean,
-                scale=stats.scale,
+                mean=norm_stats.mean,
+                scale=norm_stats.scale,
                 num_values=flat_weights_cpu.numel(),
             )
-            modified_weight_list.append(modified_flat.cpu())
+            # Simulate a saved FP32 state_dict: load the reconstructed
+            # parameters into a fresh host model, then re-extract them before
+            # decoding. This prevents the in-memory encoder tensor from
+            # bypassing serialization/reconstruction effects.
+            roundtrip_model = copy.deepcopy(pipeline.host_model.model)
+            load_modified_weights(
+                roundtrip_model,
+                restore_weights(modified_flat, weight_records),
+                strict=True,
+            )
+            serialized = io.BytesIO()
+            torch.save(roundtrip_model.state_dict(), serialized)
+            serialized.seek(0)
+            saved_state = torch.load(serialized, map_location="cpu", weights_only=True)
+            roundtrip_model = copy.deepcopy(pipeline.host_model.model).cpu()
+            roundtrip_model.load_state_dict(saved_state, strict=True)
+            roundtrip_flat = flatten_weights(extract_parameters(roundtrip_model))
+            # Use the *clean reference* normalization for receiver-side
+            # subtraction. Recomputing mean/scale from the modified model
+            # would give the receiver an unavailable statistic and change the
+            # residual seen by the decoder.
+            reference_side = original_repr.shape[-1]
+            normalized_flat = (
+                roundtrip_flat - norm_stats.mean
+            ) / norm_stats.scale
+            if normalized_flat.numel() < reference_side * reference_side:
+                normalized_flat = torch.nn.functional.pad(
+                    normalized_flat,
+                    (0, reference_side * reference_side - normalized_flat.numel()),
+                )
+            roundtrip_repr = normalized_flat.reshape(1, 1, reference_side, reference_side).to(device)
+            roundtrip_decoded = pipeline.decode(
+                roundtrip_repr.unsqueeze(0), original_repr, payload_bits
+            )
+            decoded = roundtrip_decoded
+            modified_weight_list.append(roundtrip_flat.cpu())
             payload_bits_list.append(bits.cpu().to(dtype=torch.uint8))
             decoded_bits_list.append(decoded[0])
 
@@ -255,8 +299,18 @@ def main(argv: list[str] | None = None) -> int:
     logger.info("%s", capacity)
 
     # ---- Model X-Ray detection rate ----
-    logger.info("Running Model X-Ray statistical detector…")
-    detector = ModelXRayDetector(device=args.device)
+    trained_detector = args.detector_srnet is not None or args.detector_classifier is not None
+    if trained_detector and (args.detector_srnet is None or args.detector_classifier is None):
+        raise ValueError("Pass both --detector-srnet and --detector-classifier for trained FSL evaluation.")
+    logger.info(
+        "Running %s detector…",
+        "trained Model X-Ray SRNet/FSL" if trained_detector else "statistical fallback",
+    )
+    detector = ModelXRayDetector(
+        srnet_weights_path=args.detector_srnet,
+        centroid_path=args.detector_classifier,
+        device=args.device,
+    )
     try:
         det_metrics = evaluate_detector_from_weights(
             detector,
@@ -285,7 +339,17 @@ def main(argv: list[str] | None = None) -> int:
                 args.num_classes,
             )
         logger.info("Evaluating accuracy drop on the real CIFAR-10 test set…")
-        transform = transforms.Compose([transforms.ToTensor()])
+        image_size = 224 if args.host_model in {"mobilenet_v2", "vgg16"} else 32
+        transform_ops = []
+        if image_size != 32:
+            transform_ops.append(transforms.Resize((image_size, image_size)))
+        transform_ops.append(transforms.ToTensor())
+        if args.host_model != "tiny":
+            transform_ops.append(transforms.Normalize(
+                mean=(0.485, 0.456, 0.406),
+                std=(0.229, 0.224, 0.225),
+            ))
+        transform = transforms.Compose(transform_ops)
         test_ds = CIFAR10(
             root=str(args.data_root), train=False, download=True, transform=transform
         )
@@ -324,6 +388,13 @@ def main(argv: list[str] | None = None) -> int:
             "payload_bits": payload_bits,
         },
         "capacity": {k: v for k, v in capacity.to_dict().items() if v is not None},
+        "evaluation_protocol": {
+            "reference_decoding": pipeline.config.reference_decoding,
+            "post_fp32_roundtrip": True,
+            "detector": "trained_srnet_fsl" if trained_detector else "statistical_fallback",
+            "detector_training_distribution": "benign_random_lsb_surrogate" if trained_detector else None,
+            "detector_results_are_malware_validation": False,
+        },
     }
     if det_metrics is not None:
         results["detection"] = det_metrics.to_dict()

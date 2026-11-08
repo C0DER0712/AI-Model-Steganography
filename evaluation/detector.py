@@ -232,8 +232,10 @@ class ModelXRayDetector:
         
         # Extract and flatten floating-point weights directly
         tensors = []
-        for tensor in state_dict.values():
-            if tensor.is_floating_point():
+        for name, tensor in state_dict.items():
+            # BatchNorm running statistics are buffers, not model parameters.
+            # Exclude them to match detector training and the GF representation.
+            if tensor.is_floating_point() and not name.endswith(("running_mean", "running_var")):
                 tensors.append(tensor.detach().cpu().to(dtype=torch.float32).reshape(-1))
         
         if not tensors:

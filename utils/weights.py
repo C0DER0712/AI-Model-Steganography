@@ -54,6 +54,24 @@ def extract_weights(model: nn.Module) -> list[WeightTensor]:
     return extracted
 
 
+def extract_parameters(model: nn.Module) -> list[WeightTensor]:
+    """Extract learnable parameters only, in ``named_parameters()`` order.
+
+    This is the representation used by the embedding pipeline. In particular,
+    BatchNorm running statistics are buffers and must not be mixed into the
+    encoder's normalization or parameter budget.
+    """
+    return [
+        WeightTensor(
+            name=name,
+            shape=tuple(tensor.shape),
+            dtype=tensor.dtype,
+            values=tensor.detach().cpu().to(dtype=torch.float32).clone(),
+        )
+        for name, tensor in model.named_parameters()
+    ]
+
+
 def flatten_weights(weights: Sequence[WeightTensor]) -> torch.Tensor:
     """Flatten extracted weights into one contiguous float32 vector.
 

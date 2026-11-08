@@ -54,7 +54,7 @@ from utils.representation import (
     weights_to_channels,
     weights_to_float_image,
 )
-from utils.weights import WeightTensor, extract_weights, flatten_weights
+from utils.weights import WeightTensor, extract_parameters, flatten_weights
 
 logger = logging.getLogger(__name__)
 
@@ -140,19 +140,7 @@ class EmbeddingPipeline(nn.Module):
         self._num_weight_values: int = 0
         if not cfg.train_host_model:
             with torch.no_grad():
-                # BN running_mean/running_var are float buffers but have wildly
-                # different magnitudes (running_var ≈ 100–400).  Including them in
-                # extract_weights inflates norm_scale to ~380, so a normalised
-                # delta of ±0.05 maps to ±19 in real weight space — enough to
-                # destroy classification completely.  Restrict to learnable
-                # parameters only so scale reflects actual weight magnitudes.
-                _learnable_names = frozenset(
-                    n for n, _ in self.host_model.model.named_parameters()
-                )
-                weight_records = [
-                    r for r in extract_weights(self.host_model.model)
-                    if r.name in _learnable_names
-                ]
+                weight_records = extract_parameters(self.host_model.model)
                 flat_weights = flatten_weights(weight_records)
                 float_image, stats = weights_to_float_image(flat_weights)
                 cached_repr = torch.from_numpy(float_image).float()
@@ -230,13 +218,7 @@ class EmbeddingPipeline(nn.Module):
             norm_mean = self._norm_mean
             norm_scale = self._norm_scale
         else:
-            _learnable_names = frozenset(
-                n for n, _ in self.host_model.model.named_parameters()
-            )
-            weight_records = [
-                r for r in extract_weights(self.host_model.model)
-                if r.name in _learnable_names
-            ]
+            weight_records = extract_parameters(self.host_model.model)
             flat_weights = flatten_weights(weight_records)
             float_image, stats = weights_to_float_image(flat_weights)
             original_repr = torch.from_numpy(float_image).float().to(device)
@@ -351,13 +333,7 @@ class EmbeddingPipeline(nn.Module):
             if payload_bits.ndim == 1:
                 payload_bits = payload_bits.unsqueeze(0)
             payload_bits = payload_bits.to(device=device, dtype=torch.float32)
-            _learnable_names = frozenset(
-                n for n, _ in self.host_model.model.named_parameters()
-            )
-            weight_records = [
-                r for r in extract_weights(self.host_model.model)
-                if r.name in _learnable_names
-            ]
+            weight_records = extract_parameters(self.host_model.model)
             flat_weights = flatten_weights(weight_records)
             float_image, _stats = weights_to_float_image(flat_weights)
             original_repr = torch.from_numpy(float_image).float().to(device)
@@ -383,13 +359,7 @@ class EmbeddingPipeline(nn.Module):
                     if self._cached_original_repr_buf is not None:
                         orig = self._cached_original_repr_buf.to(device).float()
                     else:
-                        _learnable_names = frozenset(
-                            n for n, _ in self.host_model.model.named_parameters()
-                        )
-                        weight_records = [
-                            r for r in extract_weights(self.host_model.model)
-                            if r.name in _learnable_names
-                        ]
+                        weight_records = extract_parameters(self.host_model.model)
                         flat = flatten_weights(weight_records)
                         float_image, _stats = weights_to_float_image(flat)
                         orig = torch.from_numpy(float_image).float().to(device)
