@@ -47,6 +47,7 @@ import io
 import json
 import logging
 import sys
+from dataclasses import fields
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
@@ -64,8 +65,10 @@ from evaluation.capacity import compute_capacity
 from evaluation.detector import ModelXRayDetector
 from evaluation.metrics import evaluate_detector_from_weights
 from evaluation.plotting import plot_metrics_summary
-from models.decoder import bit_error_rate as decoder_ber
+from models.decoder import DecoderConfig
+from models.encoder import EncoderConfig
 from models.pipeline import EmbeddingPipeline, PipelineConfig
+from evaluation.differentiable_detector import DifferentiableDetectorConfig
 from training.dataset import SyntheticWeightDataset
 from utils.config import load_config
 from utils.logging import configure_logging
@@ -184,25 +187,36 @@ def main(argv: list[str] | None = None) -> int:
     payload_size_str = args.payload_size
     payload_bits = SUPPORTED_PAYLOAD_SIZES[payload_size_str] * 8
 
-    # ---- Build or load pipeline ----
-    pipeline_cfg = PipelineConfig(
-        host_model_name=args.host_model,
-        host_model_num_classes=args.num_classes,
-        host_model_pretrained=False,
-        host_model_checkpoint=(str(args.host_checkpoint) if args.host_checkpoint else None),
+    # Load the trainer metadata before construction so the architecture
+    # (notably bits_per_pixel and adaptive-capacity layers) matches training.
+    ckpt = None
+    if args.checkpoint is not None and not args.baseline_only:
+        logger.info("Loading checkpoint metadata from %s", args.checkpoint)
+        ckpt = torch.load(args.checkpoint, map_location="cpu", weights_only=True)
+    saved_pipeline_cfg = (
+        ckpt.get("config", {}).get("pipeline", {}) if isinstance(ckpt, dict) else {}
+    )
+    pipeline_cfg = _pipeline_config_for_evaluation(
+        saved_pipeline_cfg,
+        host_model=args.host_model,
+        num_classes=args.num_classes,
+        host_checkpoint=args.host_checkpoint,
         payload_bits=payload_bits,
     )
+    if saved_pipeline_cfg and saved_pipeline_cfg.get("payload_bits") not in (None, payload_bits):
+        raise ValueError(
+            f"Requested {payload_size_str} ({payload_bits:,} bits), but the checkpoint "
+            f"was trained for {saved_pipeline_cfg['payload_bits']:,} bits. Use the "
+            "matching --payload-size."
+        )
     pipeline = EmbeddingPipeline(pipeline_cfg)
-
     device = _resolve_device(args.device)
     pipeline = pipeline.to(device)
     pipeline.eval()
 
-    if args.checkpoint is not None and not args.baseline_only:
-        logger.info("Loading checkpoint from %s", args.checkpoint)
-        ckpt = torch.load(args.checkpoint, map_location=device, weights_only=True)
+    if ckpt is not None:
         state = ckpt.get("model", ckpt)
-        pipeline.load_state_dict(state, strict=False)
+        pipeline.load_state_dict(state, strict=True)
         logger.info("Checkpoint loaded.")
     else:
         logger.info("No checkpoint provided — evaluating untrained baseline.")
@@ -417,6 +431,48 @@ def _resolve_device(device: str) -> torch.device:
             return torch.device("mps")
         return torch.device("cpu")
     return torch.device(device)
+
+
+def _pipeline_config_for_evaluation(
+    saved_config: dict,
+    *,
+    host_model: str,
+    num_classes: int,
+    host_checkpoint: Path | None,
+    payload_bits: int,
+) -> PipelineConfig:
+    """Rebuild the pipeline architecture recorded in a trainer checkpoint."""
+    def make_config(config_type, values: dict, **overrides):
+        accepted = {field.name for field in fields(config_type)}
+        arguments = {key: value for key, value in values.items() if key in accepted}
+        arguments.update(overrides)
+        return config_type(**arguments)
+
+    saved = saved_config if isinstance(saved_config, dict) else {}
+    encoder_values = dict(saved.get("encoder") or {})
+    decoder_values = dict(saved.get("decoder") or {})
+    detector_values = dict(saved.get("detector") or {})
+    encoder = make_config(EncoderConfig, encoder_values, payload_dim=payload_bits)
+    decoder = make_config(DecoderConfig, decoder_values)
+    detector = make_config(DifferentiableDetectorConfig, detector_values)
+
+    pipeline_fields = {field.name for field in fields(PipelineConfig)}
+    arguments = {
+        key: value
+        for key, value in saved.items()
+        if key in pipeline_fields and key not in {"encoder", "decoder", "detector"}
+    }
+    arguments.update({
+        "host_model_name": host_model,
+        "host_model_num_classes": num_classes,
+        "host_model_pretrained": False,
+        "host_model_checkpoint": str(host_checkpoint) if host_checkpoint else None,
+        "payload_bits": payload_bits,
+        "encoder": encoder,
+        "decoder": decoder,
+        "detector": detector,
+    })
+    return PipelineConfig(**arguments)
 
 
 if __name__ == "__main__":
