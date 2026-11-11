@@ -639,7 +639,8 @@ def _pipeline_config_for_evaluation(
     encoder_values.update(saved.get("encoder") or {})
     decoder_values = inferred_decoder
     decoder_values.update(saved.get("decoder") or {})
-    detector_values = dict(saved.get("detector") or {})
+    detector_values = _infer_detector_config(state_dict or {})
+    detector_values.update(saved.get("detector") or {})
     encoder = make_config(EncoderConfig, encoder_values, payload_dim=payload_bits)
     decoder = make_config(DecoderConfig, decoder_values)
     if encoder.bits_per_pixel != decoder.bits_per_pixel:
@@ -728,6 +729,37 @@ def _infer_encoder_decoder_config(state: dict) -> tuple[dict, dict]:
         "bits_per_pixel": projection[0] if projection else 1,
     }
     return encoder, decoder
+
+
+def _infer_detector_config(state: dict) -> dict:
+    """Infer differentiable-detector dimensions from a pipeline state dict."""
+    def shape(key: str) -> tuple[int, ...] | None:
+        value = state.get(key)
+        return tuple(value.shape) if isinstance(value, torch.Tensor) else None
+
+    def block_count(prefix: str) -> int:
+        indexes = [
+            int(match.group(1))
+            for key in state
+            if (match := re.match(rf"detector\.{prefix}\.(\d+)\.conv1\.weight$", key))
+        ]
+        if indexes:
+            return max(indexes) + 1
+        if any(key.startswith(f"detector.{prefix}.") for key in state):
+            return 0
+        return 4 if prefix == "type1_blocks" else 3
+
+    hpf_shape = shape("detector.hpf.weight")
+    stem_shape = shape("detector.stem.0.weight")
+    classifier_shape = shape("detector.classifier.1.weight")
+    return {
+        "input_channels": hpf_shape[1] if hpf_shape and len(hpf_shape) >= 2 else 4,
+        "hpf_channels": hpf_shape[0] if hpf_shape else 30,
+        "base_channels": stem_shape[0] if stem_shape else 32,
+        "num_type1_blocks": block_count("type1_blocks"),
+        "num_type2_blocks": block_count("type2_blocks"),
+        "fc_hidden_dim": classifier_shape[0] if classifier_shape else 128,
+    }
 
 
 def _pipeline_config_from_toml(
