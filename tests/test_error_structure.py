@@ -40,3 +40,17 @@ def test_error_pattern_metrics_handles_zero_error_payload():
     assert metrics["adjacent_error_pair_rate"] == 0.0
     assert metrics["error_run_lengths"]["count"] == 0
     assert metrics["per_position_error_rate_across_payload_runs"]["max"] == 0.0
+
+
+def test_error_pattern_metrics_reports_repeatable_weak_position_bins():
+    payloads = [torch.zeros(512, dtype=torch.uint8) for _ in range(8)]
+    recovered = [payload.clone() for payload in payloads]
+    for run in recovered:
+        run[10:12] = 1
+
+    metrics = _error_pattern_metrics(payloads, recovered)
+    positions = metrics["per_position_error_rate_across_payload_runs"]
+
+    assert positions["bin_error_rates"][5] == 1.0
+    assert positions["split_half_stability"]["pearson_correlation_of_bin_rates"] > 0.99
+    assert positions["split_half_stability"]["top_decile_bin_overlap_fraction"] == 1.0

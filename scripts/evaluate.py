@@ -207,6 +207,7 @@ def _error_pattern_metrics(
 
     run_count_by_length: dict[int, int] = {}
     position_error_counts: np.ndarray | None = None
+    position_error_rates_by_run: np.ndarray | None = None
     position_widths: np.ndarray | None = None
     bit_count = 0
     error_count = 0
@@ -216,7 +217,9 @@ def _error_pattern_metrics(
     max_run_length = 0
     expected_iid_pair_count = 0.0
     sequence_length: int | None = None
-    for original, recovered in zip(payload_bits_list, decoded_bits_list):
+    for run_index, (original, recovered) in enumerate(
+        zip(payload_bits_list, decoded_bits_list)
+    ):
         original_np = original.detach().cpu().numpy().reshape(-1)
         recovered_np = recovered.detach().cpu().numpy().reshape(-1)
         n = min(original_np.size, recovered_np.size)
@@ -230,6 +233,9 @@ def _error_pattern_metrics(
             )
             position_widths = np.diff(position_edges)
             position_error_counts = np.zeros(num_position_bins, dtype=np.float64)
+            position_error_rates_by_run = np.zeros(
+                (len(payload_bits_list), num_position_bins), dtype=np.float64
+            )
         elif n != sequence_length:
             raise ValueError("All payload runs must have the same bit length")
         errors = (original_np[:n] != recovered_np[:n]).astype(np.uint8)
@@ -243,6 +249,9 @@ def _error_pattern_metrics(
         assert position_widths is not None
         for bin_index, (start, end) in enumerate(zip(position_edges[:-1], position_edges[1:])):
             position_error_counts[bin_index] += errors[start:end].sum()
+            position_error_rates_by_run[run_index, bin_index] = float(
+                errors[start:end].mean()
+            )
         padded = np.pad(errors, (1, 1), constant_values=0)
         padded = padded.astype(np.int8, copy=False)
         starts = np.flatnonzero(np.diff(padded) == 1)
@@ -260,6 +269,7 @@ def _error_pattern_metrics(
         sequence_length is not None
         and position_widths is not None
         and position_error_counts is not None
+        and position_error_rates_by_run is not None
     )
     observed_ber = error_count / bit_count
     pair_rate = pair_count / pair_slots if pair_slots else 0.0
@@ -269,6 +279,32 @@ def _error_pattern_metrics(
         expected_iid_pair_count / error_count if error_count else 0.0
     )
     position_error_rates = position_error_counts / (position_widths * sample_count)
+    iid_position_sampling_std = float(
+        np.sqrt(
+            observed_ber * (1.0 - observed_ber)
+            / float(np.mean(position_widths * sample_count))
+        )
+    )
+    half = sample_count // 2
+    split_half_stability: dict[str, object] | None = None
+    if half > 0 and sample_count - half > 0:
+        first_half_rates = position_error_rates_by_run[:half].mean(axis=0)
+        second_half_rates = position_error_rates_by_run[half:].mean(axis=0)
+        if first_half_rates.std() > 0 and second_half_rates.std() > 0:
+            correlation = float(np.corrcoef(first_half_rates, second_half_rates)[0, 1])
+        else:
+            correlation = None
+        top_count = max(1, int(np.ceil(position_error_rates.size * 0.1)))
+        first_top = set(np.argsort(first_half_rates)[-top_count:].tolist())
+        second_top = set(np.argsort(second_half_rates)[-top_count:].tolist())
+        first_bottom = set(np.argsort(first_half_rates)[:top_count].tolist())
+        second_bottom = set(np.argsort(second_half_rates)[:top_count].tolist())
+        split_half_stability = {
+            "runs_per_half": [half, sample_count - half],
+            "pearson_correlation_of_bin_rates": correlation,
+            "top_decile_bin_overlap_fraction": len(first_top & second_top) / top_count,
+            "bottom_decile_bin_overlap_fraction": len(first_bottom & second_bottom) / top_count,
+        }
     p95_rank = int(np.ceil(0.95 * run_count))
     cumulative_runs = 0
     run_length_p95 = 0
@@ -303,11 +339,19 @@ def _error_pattern_metrics(
         },
         "per_position_error_rate_across_payload_runs": {
             "equal_width_bins": int(position_error_rates.size),
+            "bits_per_bin": position_widths.astype(int).tolist(),
             "mean": float(position_error_rates.mean()),
             "std": float(position_error_rates.std()),
+            "iid_sampling_std_reference": iid_position_sampling_std,
+            "std_to_iid_sampling_std_ratio": (
+                float(position_error_rates.std() / iid_position_sampling_std)
+                if iid_position_sampling_std > 0 else None
+            ),
             "p95": float(np.quantile(position_error_rates, 0.95)),
             "p99": float(np.quantile(position_error_rates, 0.99)),
             "max": float(position_error_rates.max()),
+            "bin_error_rates": position_error_rates.round(8).tolist(),
+            "split_half_stability": split_half_stability,
             "note": "Position rates are noisy when few payload runs are evaluated.",
         },
     }
