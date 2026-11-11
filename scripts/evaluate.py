@@ -193,6 +193,126 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     return parser.parse_args(argv)
 
 
+def _error_pattern_metrics(
+    payload_bits_list: list[torch.Tensor],
+    decoded_bits_list: list[torch.Tensor],
+) -> dict[str, object]:
+    """Summarize BER dependence and payload-position variation descriptively.
+
+    This is a diagnostic, not a formal independence test. Each sequence is
+    analyzed separately so adjacent pairs and runs never cross sample edges.
+    """
+    if len(payload_bits_list) != len(decoded_bits_list) or not payload_bits_list:
+        raise ValueError("Expected equally sized, non-empty payload and decoded lists")
+
+    run_count_by_length: dict[int, int] = {}
+    position_error_counts: np.ndarray | None = None
+    position_widths: np.ndarray | None = None
+    bit_count = 0
+    error_count = 0
+    pair_count = 0
+    pair_slots = 0
+    run_count = 0
+    max_run_length = 0
+    expected_iid_pair_count = 0.0
+    sequence_length: int | None = None
+    for original, recovered in zip(payload_bits_list, decoded_bits_list):
+        original_np = original.detach().cpu().numpy().reshape(-1)
+        recovered_np = recovered.detach().cpu().numpy().reshape(-1)
+        n = min(original_np.size, recovered_np.size)
+        if n == 0:
+            raise ValueError("Payload sequences must contain at least one bit")
+        if sequence_length is None:
+            sequence_length = n
+            num_position_bins = min(256, n)
+            position_edges = np.linspace(
+                0, n, num_position_bins + 1, dtype=np.int64
+            )
+            position_widths = np.diff(position_edges)
+            position_error_counts = np.zeros(num_position_bins, dtype=np.float64)
+        elif n != sequence_length:
+            raise ValueError("All payload runs must have the same bit length")
+        errors = (original_np[:n] != recovered_np[:n]).astype(np.uint8)
+        sample_error_count = int(errors.sum())
+        sample_ber = sample_error_count / n
+        error_count += sample_error_count
+        bit_count += n
+        expected_iid_pair_count += max(0, n - 1) * sample_ber ** 2
+        pair_count += int(np.count_nonzero(errors[:-1] & errors[1:]))
+        pair_slots += max(0, n - 1)
+        assert position_widths is not None
+        for bin_index, (start, end) in enumerate(zip(position_edges[:-1], position_edges[1:])):
+            position_error_counts[bin_index] += errors[start:end].sum()
+        padded = np.pad(errors, (1, 1), constant_values=0)
+        padded = padded.astype(np.int8, copy=False)
+        starts = np.flatnonzero(np.diff(padded) == 1)
+        ends = np.flatnonzero(np.diff(padded) == -1)
+        lengths, counts = np.unique(ends - starts, return_counts=True)
+        run_count += int(counts.sum())
+        if lengths.size:
+            max_run_length = max(max_run_length, int(lengths[-1]))
+        for length, count in zip(lengths, counts):
+            key = int(length)
+            run_count_by_length[key] = run_count_by_length.get(key, 0) + int(count)
+
+    sample_count = len(payload_bits_list)
+    assert (
+        sequence_length is not None
+        and position_widths is not None
+        and position_error_counts is not None
+    )
+    observed_ber = error_count / bit_count
+    pair_rate = pair_count / pair_slots if pair_slots else 0.0
+    iid_pair_rate = expected_iid_pair_count / pair_slots if pair_slots else 0.0
+    conditional_pair_rate = pair_count / error_count if error_count else 0.0
+    iid_conditional_pair_rate = (
+        expected_iid_pair_count / error_count if error_count else 0.0
+    )
+    position_error_rates = position_error_counts / (position_widths * sample_count)
+    p95_rank = int(np.ceil(0.95 * run_count))
+    cumulative_runs = 0
+    run_length_p95 = 0
+    for length, count in sorted(run_count_by_length.items()):
+        cumulative_runs += count
+        if cumulative_runs >= p95_rank:
+            run_length_p95 = length
+            break
+    expected_iid_run_p95 = (
+        int(np.ceil(np.log(0.05) / np.log(observed_ber)))
+        if 0.0 < observed_ber < 1.0 else None
+    )
+
+    return {
+        "status": "descriptive_diagnostic_not_a_formal_independence_test",
+        "payload_runs": sample_count,
+        "bits_per_run": int(sequence_length),
+        "adjacent_error_pair_rate": pair_rate,
+        "iid_expected_adjacent_pair_rate_at_observed_ber": iid_pair_rate,
+        "adjacent_error_pair_rate_excess_over_iid": pair_rate - iid_pair_rate,
+        "probability_next_bit_is_error_given_error": conditional_pair_rate,
+        "iid_expected_next_bit_error_probability": iid_conditional_pair_rate,
+        "error_run_lengths": {
+            "count": run_count,
+            "mean": error_count / run_count if run_count else 0.0,
+            "p95": run_length_p95,
+            "max": max_run_length,
+            "iid_expected_mean_at_observed_ber": (
+                1.0 / (1.0 - observed_ber) if observed_ber < 1.0 else None
+            ),
+            "iid_expected_p95_at_observed_ber": expected_iid_run_p95,
+        },
+        "per_position_error_rate_across_payload_runs": {
+            "equal_width_bins": int(position_error_rates.size),
+            "mean": float(position_error_rates.mean()),
+            "std": float(position_error_rates.std()),
+            "p95": float(np.quantile(position_error_rates, 0.95)),
+            "p99": float(np.quantile(position_error_rates, 0.99)),
+            "max": float(position_error_rates.max()),
+            "note": "Position rates are noisy when few payload runs are evaluated.",
+        },
+    }
+
+
 def main(argv: list[str] | None = None) -> int:
     args = parse_args(argv)
     configure_logging(level="DEBUG" if args.verbose else "INFO")
@@ -338,8 +458,16 @@ def main(argv: list[str] | None = None) -> int:
 
     mean_ber = float(np.mean(bers))
     mean_accuracy = 1.0 - mean_ber
+    error_structure = _error_pattern_metrics(payload_bits_list, decoded_bits_list)
 
     logger.info("Payload recovery — BER: %.4f, Accuracy: %.4f", mean_ber, mean_accuracy)
+    logger.info(
+        "Error dependence — adjacent pair rate: %.5f (i.i.d. reference %.5f), "
+        "error-run stats: %s",
+        error_structure["adjacent_error_pair_rate"],
+        error_structure["iid_expected_adjacent_pair_rate_at_observed_ber"],
+        error_structure["error_run_lengths"],
+    )
 
     # ---- Embedding capacity ----
     capacity = compute_capacity(
@@ -453,6 +581,7 @@ def main(argv: list[str] | None = None) -> int:
             "mean_accuracy": mean_accuracy,
             "num_samples": args.num_samples,
             "payload_bits": payload_bits,
+            "error_structure": error_structure,
         },
         "capacity": {k: v for k, v in capacity.to_dict().items() if v is not None},
         "evaluation_protocol": {
