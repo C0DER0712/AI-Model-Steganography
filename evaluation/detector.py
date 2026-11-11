@@ -20,7 +20,10 @@ try:
     import model_xray
     MODEL_XRAY_AVAILABLE = True
 except ImportError:
-    logger.warning("model_xray module not found. Falling back to statistical detector.")
+    logger.info(
+        "Optional model_xray package not found; local trained SRNet/FSL loading "
+        "remains available, otherwise only the heuristic fallback can run."
+    )
     MODEL_XRAY_AVAILABLE = False
 
 # Optional SRNet / FSL detector — imported lazily to avoid circular imports

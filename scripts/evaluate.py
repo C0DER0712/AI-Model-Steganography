@@ -5,7 +5,7 @@ Loads a trained checkpoint, runs the full evaluation suite, and writes all
 metrics and figures to an output directory.  Evaluation covers:
 
   1. Payload recovery — BER, reconstruction accuracy.
-  2. Model X-Ray detection rate — statistical fallback detector.
+  2. Optional clean-vs-modified detection metrics from a trained SRNet/FSL detector.
   3. Embedding capacity — bits per parameter, embedding rate.
   4. Accuracy drop — top-1 / top-5 classification accuracy change (when an
      image dataset is available).
@@ -128,6 +128,12 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument(
         "--detector-image-size", type=int, default=256,
         help="GF image side used by the trained detector (train_detector.py defaults to 256).",
+    )
+    parser.add_argument(
+        "--detector-training-distribution",
+        choices=["unspecified", "benign_random_lsb_surrogate", "learned_encoder_carriers", "other"],
+        default="unspecified",
+        help="Provenance label for the supplied detector checkpoint; this is metadata, not verified automatically.",
     )
     parser.add_argument(
         "--dataset",
@@ -343,37 +349,48 @@ def main(argv: list[str] | None = None) -> int:
     )
     logger.info("%s", capacity)
 
-    # ---- Model X-Ray detection rate ----
+    # ---- Optional trained detector evaluation ----
     trained_detector = args.detector_srnet is not None or args.detector_classifier is not None
     if trained_detector and (args.detector_srnet is None or args.detector_classifier is None):
         raise ValueError("Pass both --detector-srnet and --detector-classifier for trained FSL evaluation.")
-    logger.info(
-        "Running %s detector…",
-        "trained Model X-Ray SRNet/FSL" if trained_detector else "statistical fallback",
-    )
-    detector = ModelXRayDetector(
-        srnet_weights_path=args.detector_srnet,
-        centroid_path=args.detector_classifier,
-        device=args.device,
-        image_size=args.detector_image_size,
-    )
-    try:
-        det_metrics = evaluate_detector_from_weights(
-            detector,
-            clean_weights=[w for w in original_weight_list],
-            modified_weights=[w for w in modified_weight_list],
-            verbose=args.verbose,
+    det_metrics = None
+    if trained_detector:
+        logger.info("Running trained Model X-Ray SRNet/FSL detector…")
+        detector = ModelXRayDetector(
+            srnet_weights_path=args.detector_srnet,
+            centroid_path=args.detector_classifier,
+            device=args.device,
+            image_size=args.detector_image_size,
         )
-        logger.info("%s", det_metrics)
-        det_figures = plot_metrics_summary(
-            det_metrics,
-            output_dir=output_dir / "figures",
-            prefix="detector",
+        # The wrapper can fall back after missing files, unavailable modules, or
+        # load errors. Never report that fallback as trained-detector evidence.
+        if not detector.use_srnet:
+            raise RuntimeError(
+                "Trained detector evaluation was requested, but SRNet/FSL did not "
+                "load. Check the checkpoint paths and Model X-Ray dependencies."
+            )
+        try:
+            det_metrics = evaluate_detector_from_weights(
+                detector,
+                clean_weights=original_weight_list,
+                modified_weights=modified_weight_list,
+                verbose=args.verbose,
+            )
+            logger.info("%s", det_metrics)
+            det_figures = plot_metrics_summary(
+                det_metrics,
+                output_dir=output_dir / "figures",
+                prefix="detector",
+            )
+            logger.info("Detection figures saved: %s", [str(p) for p in det_figures])
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("Trained detector evaluation failed: %s", exc)
+            det_metrics = None
+    else:
+        logger.info(
+            "Skipping detection metrics: no trained SRNet/FSL checkpoints supplied. "
+            "The statistical fallback is a heuristic and is not valid detection evidence."
         )
-        logger.info("Detection figures saved: %s", [str(p) for p in det_figures])
-    except Exception as exc:  # noqa: BLE001
-        logger.warning("Detector evaluation failed: %s", exc)
-        det_metrics = None
 
     # ---- Accuracy drop (only when a real image dataset is available) ----
     accuracy_result = None
@@ -441,8 +458,10 @@ def main(argv: list[str] | None = None) -> int:
         "evaluation_protocol": {
             "reference_decoding": pipeline.config.reference_decoding,
             "post_fp32_roundtrip": True,
-            "detector": "trained_srnet_fsl" if trained_detector else "statistical_fallback",
-            "detector_training_distribution": "benign_random_lsb_surrogate" if trained_detector else None,
+            "detector": "trained_srnet_fsl_single_host_pilot" if trained_detector and det_metrics is not None else "not_evaluated",
+            "detector_training_distribution": args.detector_training_distribution if trained_detector else None,
+            "detector_test_design": "one_clean_host_repeated_across_payload_variants" if trained_detector else None,
+            "fallback_detector_used_for_metrics": False,
             "detector_results_are_malware_validation": False,
         },
     }

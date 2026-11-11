@@ -2,7 +2,8 @@
 
 Verifies that the shipped ``configs/experiment.toml``, the CLI default path,
 and CLI-over-TOML precedence all produce internally consistent configurations
-with matching ``payload_bits`` / ``encoder.payload_dim`` / ``decoder.chunk_size``.
+with matching ``payload_bits`` / ``encoder.payload_dim`` and a shared encoder /
+decoder ``bits_per_pixel`` setting. The dense decoder has no chunk-size field.
 """
 
 from __future__ import annotations
@@ -56,6 +57,8 @@ def _resolve_config(argv: list[str] | None = None):
         ),
         "enc_base_channels": enc_sec.get("base_channels", 64),
         "dec_base_channels": dec_sec.get("base_channels", 64),
+        "enc_bits_per_pixel": enc_sec.get("bits_per_pixel", 1),
+        "dec_bits_per_pixel": dec_sec.get("bits_per_pixel", 1),
         "max_epochs": _resolve(args.epochs, train_sec.get("max_epochs"), 10),
         "batch_size": _resolve(args.batch_size, train_sec.get("batch_size"), 4),
         "device": _resolve(args.device, rt_sec.get("device"), "auto"),
@@ -94,11 +97,13 @@ class TestShippedTomlConfig:
         cfg = _resolve_config(["--config", TOML_PATH])
         payload_bits = cfg["payload_bits"]
 
-        enc = EncoderConfig(payload_dim=payload_bits)
-        dec = DecoderConfig(chunk_size=payload_bits)
+        enc = EncoderConfig(
+            payload_dim=payload_bits, bits_per_pixel=cfg["enc_bits_per_pixel"]
+        )
+        dec = DecoderConfig(bits_per_pixel=cfg["dec_bits_per_pixel"])
 
         assert enc.payload_dim == payload_bits
-        assert dec.chunk_size == payload_bits
+        assert dec.bits_per_pixel == enc.bits_per_pixel
 
     def test_host_model_is_supported_backbone(self) -> None:
         cfg = _resolve_config(["--config", TOML_PATH])
@@ -129,9 +134,12 @@ class TestCliDefaults:
         cfg = _resolve_config([])
         from models.encoder import EncoderConfig
         from models.decoder import DecoderConfig
-        enc = EncoderConfig(payload_dim=cfg["payload_bits"])
-        dec = DecoderConfig(chunk_size=cfg["payload_bits"])
-        assert enc.payload_dim == dec.chunk_size == cfg["payload_bits"]
+        enc = EncoderConfig(
+            payload_dim=cfg["payload_bits"], bits_per_pixel=cfg["enc_bits_per_pixel"]
+        )
+        dec = DecoderConfig(bits_per_pixel=enc.bits_per_pixel)
+        assert enc.payload_dim == cfg["payload_bits"]
+        assert enc.bits_per_pixel == dec.bits_per_pixel
 
 
 # ---------------------------------------------------------------------------
