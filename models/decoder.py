@@ -44,9 +44,9 @@ class DecoderConfig:
 
     Attributes:
         input_channels: Decoder feature channels. Reference decoding uses one
-            channel (the clean-subtracted perturbation); blind decoding uses
-            two channels (normalized modified weights and their local
-            high-pass residual), selected by ``PipelineConfig``.
+            channel (modified minus clean representation). Blind decoding uses
+            normalized modified weights and a local high-pass detail channel;
+            the pipeline selects the input layout.
         base_channels: Width of the convolutional feature extractor.
         num_residual_blocks: Number of residual CNN blocks in the extractor.
         attention_reduction: Reduction ratio for channel attention.
@@ -62,14 +62,10 @@ class DecoderConfig:
     attention_reduction: int = 8
     gradient_checkpointing: bool = False
     # Number of independent payload bits encoded per spatial position (weight
-    # pixel).  With reference_decoding=True the decoder sees the pure encoder
-    # perturbation in float space, so each grid cell's bits are read straight
-    # off the (noise-free) residual.  bits_per_pixel=1 (default) is the
-    # single-bit-per-pixel design; higher values multiply capacity at the cost
-    # of the encoder having to pack more independent signals into the per-pixel
-    # residual magnitude/pattern.  The message-conditioning machinery is
-    # independent of the number of weight-image channels, so bpp>1 still works
-    # with the single float channel — it is just a harder embedding problem.
+    # pixel). With reference decoding, the decoder sees modified minus clean
+    # representation. With blind decoding, the reveal network must separate
+    # payload evidence from the host-weight carrier itself. Higher values
+    # increase the bit density in either mode and make recovery harder.
     # Requires encoder.bits_per_pixel to match this value exactly.
     bits_per_pixel: int = 1
 
@@ -84,7 +80,7 @@ class ConvNormActivation(nn.Module):
         super().__init__()
         padding = dilation * (kernel_size // 2)
 
-        # Conv2d learns local structure in the single-channel float residual.
+        # Conv2d learns local structure in the weight-image input features.
         self.conv = nn.Conv2d(
             in_channels,
             out_channels,
@@ -138,7 +134,7 @@ class ResidualDecoderBlock(nn.Module):
     ) -> None:
         super().__init__()
 
-        # First convolution extracts local evidence from byte-plane features.
+        # First convolution extracts local evidence from the decoder features.
         self.conv1 = ConvNormActivation(channels, channels, dilation=dilation)
         # Second convolution refines evidence before residual addition.
         self.conv2 = ConvNormActivation(channels, channels, dilation=dilation)
@@ -188,9 +184,8 @@ class DensePayloadDecoder(nn.Module):
         # independent dense logit map for one bit-plane.  With bpp=1
         # (default) this is identical to the original single-channel design.
         # Higher bpp values let each spatial position carry multiple
-        # independent bits — the encoder's FiLM conditioning learns to write
-        # each bit-plane into a distinct pattern of the single-channel float
-        # residual, and the decoder reverses that mapping here.
+        # independent bits. The encoder and decoder share the same bit-plane
+        # layout in both reference and blind modes.
         self.logit_projection = nn.Conv2d(
             config.base_channels, config.bits_per_pixel, kernel_size=1
         )
@@ -252,11 +247,11 @@ class DensePayloadDecoder(nn.Module):
     def _prepare_input(self, weight_representation: torch.Tensor) -> torch.Tensor:
         """Build blind-decoder features from a single normalized weight image.
 
-        The two-channel blind input retains the absolute normalized weights
-        and adds a fixed 5x5 local high-pass residual. This gives the reveal
-        network both carrier context and a feature that emphasizes small
-        local edits. The transform is deterministic and requires no clean
-        reference model.
+        The two-channel blind input retains the normalized modified weights
+        and adds a fixed 5x5 local-detail channel (weight minus local mean).
+        This gives the reveal network both carrier context and a feature that
+        emphasizes small local edits. It is not modified-minus-clean
+        subtraction and requires no clean reference model.
         """
         if weight_representation.ndim != 4:
             return weight_representation
@@ -269,8 +264,9 @@ class DensePayloadDecoder(nn.Module):
                 weight_representation.float(), kernel_size=5, stride=1,
                 padding=2, count_include_pad=False,
             )
+            local_detail = weight_representation.float() - local_mean
             return torch.cat(
-                (weight_representation.float(), weight_representation.float() - local_mean),
+                (weight_representation.float(), local_detail),
                 dim=1,
             )
         return weight_representation

@@ -147,11 +147,8 @@ message_channels     = 32
 # values before upsampling to the weight image's resolution.
 message_prep_layers  = 2
 # Multi-bit embedding: how many independent payload bits each weight pixel
-# carries. 1 = original single-bit design. With reference_decoding=True the
-# 4 IEEE754 byte-channels of the residual can carry up to 4 independent bit
-# signals — bits_per_pixel=4 gives ~12.5% embedding rate vs 3.1% for bpp=1.
-# Four independent bit channels are required to carry a 1MB payload in the
-# MobileNetV2 learnable-weight image without dropping spatial payload cells.
+# carries. This blind experiment uses four learned bit planes per spatial
+# location; the decoder must recover them while observing the host carrier.
 # Must equal [decoder] bits_per_pixel exactly.
 bits_per_pixel       = 4
 # Adaptive capacity: the encoder learns WHICH pixels are safe to embed
@@ -161,21 +158,10 @@ bits_per_pixel       = 4
 # The model discovers spatially non-uniform capacity — genuinely adaptive.
 adaptive_capacity    = true
 attention_reduction  = 8
-# Maximum absolute per-pixel perturbation, now in NORMALISED [-1, 1] float32
-# weight space (not the old 0-255 byte scale). This is the stealth/capacity
-# dial: under reference decoding even tiny deltas recover perfectly, so keep
-# this small for a negligible classification-accuracy hit. Raise it only if
-# payload BER climbs; pull it further down once gamma (distortion) is on and
-# stealth matters. (e.g. 1e-3 is essentially invisible to the host task.)
+# Maximum absolute per-pixel perturbation in normalized float32 weight space.
+# Blind decoding must separate the signal from host weights; shrinking this
+# value can make recovery harder. Tune it against payload BER and host accuracy.
 max_delta            = 0.05
-# Large delta for Phase 1 (curriculum warmup). With reference_decoding,
-# even small deltas give perfect payload recovery — but a larger delta
-# gives the encoder more room to write the signal cleanly before the
-# accuracy constraint kicks in. The classification gradient naturally
-# reduces effective perturbation size during and after warmup. — with reference_decoding the decoder
-# sees the pure residual with zero noise, so even small deltas give near-
-# perfect payload recovery. Smaller delta = smaller weight perturbation =
-# less classification accuracy drop. Raise if payload BER climbs too high.
 
 # ---------------------------------------------------------------------------
 # Decoder architecture
@@ -190,8 +176,9 @@ bits_per_pixel     = 4
 # feature extractor down to ONE output channel (a dense bit-logit map),
 # mildly pooled to the payload grid resolution. Every setting below only
 # controls the feature extractor's depth/width, exactly like a normal CNN.
-# 1 = single-channel float perturbation (modified_float - original_float).
-input_channels     = 1
+# The runtime selects 2 for blind mode: normalized modified weights plus a
+# fixed local-detail channel. It selects 1 only for reference mode.
+input_channels     = 2
 # Matches [encoder] base_channels — no architectural requirement that they
 # be equal, but keeping them matched avoids an unnecessary asymmetry
 # between how much capacity the encoder spends writing evidence in and how
@@ -307,10 +294,9 @@ early_stopping_patience = 50
 # Curriculum: linearly ramp alpha from 0 → target over this many epochs.
 # The encoder first learns to embed the payload aggressively (unconstrained);
 # then as alpha ramps up, the classification gradient forces it to find
-# more subtle embeddings. With reference_decoding=True, even tiny residuals
-# give perfect payload recovery, so the encoder can freely shrink its
-# effective delta magnitude to satisfy the accuracy objective without
-# sacrificing payload BER. 0 = no curriculum (alpha fixed from epoch 1).
+# more subtle embeddings. Blind decoding has no clean-reference subtraction,
+# so the recovery/utility tradeoff must be measured empirically.
+# 0 = no curriculum (alpha fixed from epoch 1).
 alpha_warmup_epochs   = 0
 
 # Curriculum: alpha linearly ramps 0 -> 1.0 over the first N epochs.
