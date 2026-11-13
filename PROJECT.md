@@ -8,7 +8,9 @@ This repository studies **benign payload embedding in neural-network parameters*
 
 - A supplied, trained host classifier is kept frozen while an encoder modifies its learnable parameters.
 - The encoder represents the learnable FP32 parameter vector as a normalized square image. BatchNorm running-statistic buffers are excluded.
-- The decoder currently uses **reference decoding**: it needs the original clean representation to subtract from the modified one. This is a keyed/side-information setting, not blind extraction from a modified checkpoint.
+- The main experiment config still uses **reference decoding** for compatibility with existing runs. The `blind-decoder` branch adds an optional blind reveal path trained from the modified model's own normalized weights, with no clean checkpoint passed to the decoder. This is an implementation prototype; it has not yet established blind-recovery performance.
+- The blind reveal input combines normalized modified weights with a deterministic local high-pass feature. The receiver utility `scripts/decode_blind.py` loads the reveal network and the modified host checkpoint only; the clean host checkpoint is not part of its inputs.
+- The combined trainable encoder and decoder are capped at 1,000,000 parameters. The provided blind config uses 170,606 parameters for those two networks; the host classifier is not counted toward this research constraint.
 - Training optimizes host classification and benign payload recovery. In the checked-in experiment config, distortion and detector loss weights are zero, so training does not currently optimize stealth or detector evasion.
 - A separate Model X-Ray-style SRNet/FSL detector can be trained on clean checkpoints and benign random LSB-modified checkpoints. That is a surrogate detector experiment, not a detector trained on the learned encoder's output distribution.
 

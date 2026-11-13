@@ -36,7 +36,7 @@ from __future__ import annotations
 
 import math
 import logging
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from pathlib import Path
 from typing import Any
 
@@ -57,6 +57,7 @@ from utils.representation import (
 from utils.weights import WeightTensor, extract_parameters, flatten_weights
 
 logger = logging.getLogger(__name__)
+MAX_ENCODER_DECODER_PARAMETERS = 1_000_000
 
 
 @dataclass(frozen=True)
@@ -75,6 +76,9 @@ class PipelineConfig:
     payload_replicas: int = 1
     run_classification: bool = True
     run_detector: bool = True
+    # True: keyed decode from modified-minus-clean representation.
+    # False: blind reveal from the modified weights after receiver-side
+    # normalization; no clean host representation enters the decoder.
     reference_decoding: bool = True
 
     def __post_init__(self) -> None:
@@ -84,6 +88,12 @@ class PipelineConfig:
             object.__setattr__(self, "decoder", DecoderConfig())
         if self.detector is None:
             object.__setattr__(self, "detector", DifferentiableDetectorConfig())
+        expected_decoder_channels = 1 if self.reference_decoding else 2
+        if self.decoder.input_channels != expected_decoder_channels:
+            object.__setattr__(
+                self, "decoder",
+                replace(self.decoder, input_channels=expected_decoder_channels),
+            )
 
 
 class EmbeddingPipeline(nn.Module):
@@ -117,6 +127,17 @@ class EmbeddingPipeline(nn.Module):
             )
         self.encoder: WeightPayloadEncoder = build_encoder(cfg.encoder)
         self.decoder: DensePayloadDecoder = build_decoder(cfg.decoder)
+        trainable_payload_params = sum(
+            parameter.numel()
+            for module in (self.encoder, self.decoder)
+            for parameter in module.parameters()
+        )
+        if trainable_payload_params > MAX_ENCODER_DECODER_PARAMETERS:
+            raise ValueError(
+                "Encoder plus decoder exceed the 1,000,000-parameter project "
+                f"limit ({trainable_payload_params:,}). Reduce their widths or "
+                "residual-block counts."
+            )
         self.detector: DifferentiableDetector = DifferentiableDetector(cfg.detector)
 
         if not cfg.train_host_model:
@@ -265,7 +286,12 @@ class EmbeddingPipeline(nn.Module):
         if self.config.reference_decoding:
             decoder_input = modified_repr_batch - original_repr_batch
         else:
-            decoder_input = modified_repr_batch
+            decoder_input = _normalize_modified_weights(
+                modified_repr_batch,
+                mean=norm_mean,
+                scale=norm_scale,
+                num_values=num_weight_values,
+            )
 
         payload_logits = self.decoder(decoder_input, self.config.payload_bits)
         payload_logits_flat = payload_logits.reshape(num_replicas, -1)[
@@ -371,9 +397,57 @@ class EmbeddingPipeline(nn.Module):
                 decoder_input = modified_repr
             return self.decoder.decode(decoder_input, bits)
 
+    def decode_flat_weights(
+        self,
+        modified_weights: torch.Tensor,
+        num_bits: int | None = None,
+    ) -> torch.Tensor:
+        """Blind-decoding API: recover bits from modified weights alone.
+
+        The caller supplies only the flattened modified float32 parameters in
+        the same order used by ``extract_parameters``. This API is available
+        only when the pipeline was configured with ``reference_decoding=False``.
+        """
+        if self.config.reference_decoding:
+            raise ValueError(
+                "decode_flat_weights requires reference_decoding=False."
+            )
+        return self.decoder.decode_flat_weights(
+            modified_weights, num_bits or self.config.payload_bits
+        )
+
 
 def build_pipeline(config: PipelineConfig | None = None) -> EmbeddingPipeline:
     return EmbeddingPipeline(config)
+
+
+def _normalize_modified_weights(
+    modified_repr: torch.Tensor,
+    *,
+    mean: float,
+    scale: float,
+    num_values: int,
+) -> torch.Tensor:
+    """Differentiably apply the receiver's normalization to modified weights.
+
+    ``modified_repr`` uses the clean host's affine normalization internally
+    so the classifier path can reconstruct weights. A blind receiver has only
+    the modified model, so derive fresh mean/max-abs statistics from those
+    reconstructed weights, matching ``weights_to_float_image`` without a
+    detach or CPU conversion.
+    """
+    batch, channels, height, width = modified_repr.shape
+    flat = modified_repr.reshape(batch, -1) * scale + mean
+    real_values = flat[:, :num_values]
+    modified_mean = real_values.mean(dim=1, keepdim=True)
+    centered = real_values - modified_mean
+    modified_scale = centered.abs().amax(dim=1, keepdim=True).clamp_min(1e-12)
+    normalized = centered / modified_scale
+    if normalized.shape[1] < height * width:
+        normalized = torch.nn.functional.pad(
+            normalized, (0, height * width - normalized.shape[1])
+        )
+    return normalized[:, : height * width].reshape(batch, channels, height, width)
 
 
 class _WeightsToChannelsSTE(torch.autograd.Function):

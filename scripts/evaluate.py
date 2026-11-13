@@ -469,22 +469,30 @@ def main(argv: list[str] | None = None) -> int:
             roundtrip_model = copy.deepcopy(pipeline.host_model.model).cpu()
             roundtrip_model.load_state_dict(saved_state, strict=True)
             roundtrip_flat = flatten_weights(extract_parameters(roundtrip_model))
-            # Use the *clean reference* normalization for receiver-side
-            # subtraction. Recomputing mean/scale from the modified model
-            # would give the receiver an unavailable statistic and change the
-            # residual seen by the decoder.
-            reference_side = original_repr.shape[-1]
-            normalized_flat = (
-                roundtrip_flat - norm_stats.mean
-            ) / norm_stats.scale
-            if normalized_flat.numel() < reference_side * reference_side:
-                normalized_flat = torch.nn.functional.pad(
-                    normalized_flat,
-                    (0, reference_side * reference_side - normalized_flat.numel()),
-                )
-            roundtrip_repr = normalized_flat.reshape(1, 1, reference_side, reference_side).to(device)
+            if pipeline.config.reference_decoding:
+                # Keyed/reference mode uses the original host's normalization
+                # and subtracts the original representation in pipeline.decode.
+                reference_side = original_repr.shape[-1]
+                normalized_flat = (
+                    roundtrip_flat - norm_stats.mean
+                ) / norm_stats.scale
+                if normalized_flat.numel() < reference_side * reference_side:
+                    normalized_flat = torch.nn.functional.pad(
+                        normalized_flat,
+                        (0, reference_side * reference_side - normalized_flat.numel()),
+                    )
+                roundtrip_repr = normalized_flat.reshape(
+                    1, 1, reference_side, reference_side
+                ).to(device)
+            else:
+                # Blind mode derives normalization from the modified model
+                # itself. The clean representation is never decoder input.
+                modified_image, _ = weights_to_float_image(roundtrip_flat)
+                roundtrip_repr = torch.from_numpy(modified_image).unsqueeze(0).to(device)
             roundtrip_decoded = pipeline.decode(
-                roundtrip_repr, original_repr, payload_bits
+                roundtrip_repr,
+                original_repr if pipeline.config.reference_decoding else None,
+                payload_bits,
             )
             decoded = roundtrip_decoded
             modified_weight_list.append(roundtrip_flat.cpu())
@@ -687,6 +695,8 @@ def _pipeline_config_for_evaluation(
     detector_values.update(saved.get("detector") or {})
     encoder = make_config(EncoderConfig, encoder_values, payload_dim=payload_bits)
     decoder = make_config(DecoderConfig, decoder_values)
+    if not saved.get("reference_decoding", True) and decoder.input_channels != 2:
+        decoder = make_config(DecoderConfig, decoder_values, input_channels=2)
     if encoder.bits_per_pixel != decoder.bits_per_pixel:
         raise ValueError(
             "Checkpoint/config disagrees on bits_per_pixel: "
@@ -837,7 +847,9 @@ def _pipeline_config_from_toml(
         bits_per_pixel=bpp,
         adaptive_capacity=encoder_values.get("adaptive_capacity", False),
     )
+    reference_decoding = pipeline_values.get("reference_decoding", True)
     decoder = DecoderConfig(
+        input_channels=1 if reference_decoding else 2,
         base_channels=decoder_values.get("base_channels", 64),
         num_residual_blocks=decoder_values.get("num_residual_blocks", 4),
         attention_reduction=decoder_values.get("attention_reduction", 8),
@@ -864,7 +876,7 @@ def _pipeline_config_from_toml(
         payload_replicas=training.get("payload_replicas", 1),
         run_classification=True,
         run_detector=False,
-        reference_decoding=pipeline_values.get("reference_decoding", True),
+        reference_decoding=reference_decoding,
     )
 
 

@@ -1,0 +1,399 @@
+# Full experiment configuration for the steganographic embedding pipeline.
+# CLI flags in scripts/train.py and scripts/evaluate.py override these values.
+
+[project]
+name = "blind-model-steganography-research"
+purpose = "defensive-ai-security-research"
+
+[safety]
+payload_type = "benign_random"
+allow_malware_generation = false
+allow_malware_execution = false
+
+# ---------------------------------------------------------------------------
+# Runtime
+# ---------------------------------------------------------------------------
+
+[runtime]
+device = "auto"          # "auto" | "cpu" | "cuda" | "mps"
+seed   = 42
+python_version = "3.11"
+
+# ---------------------------------------------------------------------------
+# Data
+# ---------------------------------------------------------------------------
+
+[data]
+# This configuration is for the real CIFAR-10 host task, not synthetic
+# smoke-test images and labels.
+dataset = "cifar10"
+# ImageNet-pretrained MobileNetV2 is fine-tuned and evaluated at this size.
+image_size = 224
+# Payload size embedded into each host model.
+# Must be one of: "128KB", "256KB", "512KB", "1MB".
+# Start smaller (32KB not in the supported set, so use 128KB) while getting
+# a config running on a small GPU, then scale up once training is stable.
+payload_size = "128KB"  # Start small for the harder blind-decoding objective.
+# MobileNetV2's learnable-weight image is 1871x1871, so every payload cell
+# has a distinct host location. scripts/train.py validates this at runtime.
+
+# Number of synthetic training samples when no real dataset is provided.
+synthetic_samples = 512
+
+# The host is fine-tuned once on all CIFAR-10 training images. Embedding uses
+# a small calibration subset; validation uses held-out test images.
+max_train_samples = 1024
+max_val_samples = 1024
+
+# Fraction reserved for validation.
+val_split = 0.1
+
+# DataLoader workers (0 = main process only, safe for all platforms).
+num_workers = 0
+
+# ---------------------------------------------------------------------------
+# Host model
+# ---------------------------------------------------------------------------
+
+[host_model]
+# One of: "resnet18", "resnet50", "mobilenet_v2", "vgg16", "tiny", "tiny_bn".
+# NOTE: the encoder/decoder/detector run full CNNs directly over the
+# host model's weight-image (side length = ceil(sqrt(num_params))), so
+# memory scales with host-model size, not just batch_size:
+#   tiny/tiny_bn  ~40x40      -- fits any GPU, use for pipeline smoke-tests
+#   mobilenet_v2  1873x1873   -- smallest real backbone, best starting point
+#   resnet18      3419x3419   -- tight even on an 8GB consumer GPU
+#   resnet50      5056x5056   -- needs a much larger GPU or further changes
+#   vgg16         11763x11763 -- not feasible on a single consumer GPU as-is
+name = "mobilenet_v2"
+
+# CIFAR-10 has ten output classes. The ImageNet-pretrained feature extractor
+# is retained while its final classifier is replaced for this task.
+num_classes = 10
+
+# Load official pretrained ImageNet weights.
+pretrained = true
+
+# Create this with scripts/pretrain_host.py before the embedding run.
+# Set this to the CIFAR-10 fine-tuned checkpoint created by
+# scripts/pretrain_host.py. No machine-specific Kaggle path is assumed.
+checkpoint = "outputs/host_pretraining/mobilenet_v2_cifar10.pt"
+
+# Allow the host model to be fine-tuned alongside encoder/decoder.
+train_host_model = false
+
+# ---------------------------------------------------------------------------
+# Encoder architecture
+# ---------------------------------------------------------------------------
+
+# ---------------------------------------------------------------------------
+# Pipeline behaviour
+# ---------------------------------------------------------------------------
+
+[pipeline]
+# Blind decoding: train the reveal network from normalized modified weights
+# alone. The receiver does not receive the clean host checkpoint. The decoder
+# gets raw normalized weights plus a fixed local high-pass feature.
+# The 128 KB starting payload is intentionally conservative; scale only after
+# validating recovery and host utility on held-out payloads.
+reference_decoding = false
+
+[encoder]
+# NOTE: payload_dim is automatically derived from data.payload_size at runtime.
+# Do NOT set payload_dim here — any value is ignored by scripts/train.py.
+# payload_dim = <auto>  →  SUPPORTED_PAYLOAD_SIZES[payload_size] * 8
+# Float32 weight representation: one normalised value per weight parameter,
+# so the encoder reads and writes a single channel (no more 4 IEEE754 byte
+# planes). (Informational — scripts/train.py uses the dataclass defaults.)
+input_channels       = 1
+output_channels      = 1
+# Architecture v2 (dense/fully-convolutional, see models/encoder.py module
+# docstring): removed chunking, per-chunk shared projection, and chunk
+# position encoding entirely — the payload is reshaped into a square bitmap
+# and every bit gets its own dedicated spatial location end-to-end, so
+# there's no more "chunk_size/base_channels ratio" to tune (that entire
+# class of failure mode no longer exists in this design).
+#
+# base_channels=32 kept at the value already proven to fit on Kaggle's
+# T4/P100 without OOM. This is a conservative choice, not a re-tuned one —
+# per-instruction, this architecture is meant to be final, not iterated on.
+# Real headroom exists to raise this later (the detector's full CNN forward
+# pass, historically the dominant memory cost, is currently disabled via
+# run_detector=False since delta=0 — see models/pipeline.py), but that's a
+# distinct experiment from finalizing this architecture, not bundled in here.
+base_channels        = 32
+# Bumped 3 -> 4: depth is now more directly useful than before, since every
+# block re-injects per-pixel message conditioning via SpatialFiLM (deeper
+# = more chances for the network to refine each bit's local encoding), and
+# gradient_checkpointing below keeps the memory cost of the extra block
+# roughly free (recomputes activations during backward instead of storing
+# them, so peak memory doesn't scale with depth the way it does with width).
+num_residual_blocks  = 4
+# Cuts peak activation memory substantially at the cost of extra compute
+# during backward (recomputes forward activations). Turn this on first if
+# you hit CUDA OOM, before shrinking base_channels/num_residual_blocks
+# further, since it doesn't reduce model capacity/quality.
+gradient_checkpointing = true
+# Width of the small conv stack that gives each payload bit local context
+# before it modulates the weight features (see MessagePreparationNetwork).
+# Deliberately independent of base_channels/payload size — it only needs
+# enough capacity to extract useful local bit-pattern context, not to carry
+# the weight-image's own feature representation. 32 is a comfortably
+# generous width for a 2-layer stack operating on a single-channel input.
+message_channels     = 32
+# Number of conv layers in the message-preparation stack (see above). 2 is
+# the minimum useful depth: layer 1 lifts the raw bitmap into feature
+# space, layer 2 lets each location incorporate its immediate neighbors'
+# values before upsampling to the weight image's resolution.
+message_prep_layers  = 2
+# Multi-bit embedding: how many independent payload bits each weight pixel
+# carries. 1 = original single-bit design. With reference_decoding=True the
+# 4 IEEE754 byte-channels of the residual can carry up to 4 independent bit
+# signals — bits_per_pixel=4 gives ~12.5% embedding rate vs 3.1% for bpp=1.
+# Four independent bit channels are required to carry a 1MB payload in the
+# MobileNetV2 learnable-weight image without dropping spatial payload cells.
+# Must equal [decoder] bits_per_pixel exactly.
+bits_per_pixel       = 4
+# Adaptive capacity: the encoder learns WHICH pixels are safe to embed
+# bits in, rather than uniformly embedding bpp bits everywhere. The gate
+# g ∈ [0,1] per pixel is driven by capacity loss (eta → use more pixels),
+# classification loss (alpha → protect sensitive pixels), and payload loss.
+# The model discovers spatially non-uniform capacity — genuinely adaptive.
+adaptive_capacity    = true
+attention_reduction  = 8
+# Maximum absolute per-pixel perturbation, now in NORMALISED [-1, 1] float32
+# weight space (not the old 0-255 byte scale). This is the stealth/capacity
+# dial: under reference decoding even tiny deltas recover perfectly, so keep
+# this small for a negligible classification-accuracy hit. Raise it only if
+# payload BER climbs; pull it further down once gamma (distortion) is on and
+# stealth matters. (e.g. 1e-3 is essentially invisible to the host task.)
+max_delta            = 0.05
+# Large delta for Phase 1 (curriculum warmup). With reference_decoding,
+# even small deltas give perfect payload recovery — but a larger delta
+# gives the encoder more room to write the signal cleanly before the
+# accuracy constraint kicks in. The classification gradient naturally
+# reduces effective perturbation size during and after warmup. — with reference_decoding the decoder
+# sees the pure residual with zero noise, so even small deltas give near-
+# perfect payload recovery. Smaller delta = smaller weight perturbation =
+# less classification accuracy drop. Raise if payload BER climbs too high.
+
+# ---------------------------------------------------------------------------
+# Decoder architecture
+# ---------------------------------------------------------------------------
+
+[decoder]
+# bits_per_pixel must match [encoder] bits_per_pixel exactly.
+bits_per_pixel     = 4
+# Architecture v2 (dense/fully-convolutional, see models/decoder.py module
+# docstring): no chunk_size, no shared per-chunk MLP head, no chunk
+# position encoding, no region_pool_size — the decoder is a plain conv
+# feature extractor down to ONE output channel (a dense bit-logit map),
+# mildly pooled to the payload grid resolution. Every setting below only
+# controls the feature extractor's depth/width, exactly like a normal CNN.
+# 1 = single-channel float perturbation (modified_float - original_float).
+input_channels     = 1
+# Matches [encoder] base_channels — no architectural requirement that they
+# be equal, but keeping them matched avoids an unnecessary asymmetry
+# between how much capacity the encoder spends writing evidence in and how
+# much capacity the decoder spends reading it back out.
+base_channels      = 32
+num_residual_blocks = 4
+attention_reduction = 8
+gradient_checkpointing = true
+
+# ---------------------------------------------------------------------------
+# Differentiable (frozen) detector architecture
+# ---------------------------------------------------------------------------
+
+[detector]
+input_channels       = 4
+hpf_channels         = 8
+base_channels        = 8
+num_type1_blocks     = 2
+num_type2_blocks     = 2
+truncation_threshold = 3.0
+fc_hidden_dim        = 128
+dropout              = 0.5
+
+# ---------------------------------------------------------------------------
+# Training objectives
+# The four loss weights correspond to the research objective:
+#   L = α * classification + β * payload + γ * distortion + δ * detector
+# ---------------------------------------------------------------------------
+
+[loss_weights]
+# Phase 2: payload + classification. Teaches the encoder to carry bits
+# while preserving MobileNetV2 accuracy on CIFAR-10.
+# gamma (distortion) and delta (detector) intentionally kept at 0 for now —
+# add them in a third phase once payload+classification are stable.
+# Run with --dataset cifar10 (synthetic data has random labels -> classification
+# loss is meaningless on synthetic images).
+alpha = 1.0   # Host model accuracy preservation (requires --dataset cifar10)
+beta  = 2.0   # Give payload recovery more weight; monitor host accuracy constraint.
+gamma = 0.0   # Weight-representation distortion (add later)
+delta = 0.0   # Frozen detector evasion (add later)
+# Capacity maximisation weight (eta). Pushes learned gate → 1 (use more
+# weight pixels). Alpha pushes it back → 0 for sensitive pixels. Together
+# they find the Pareto-optimal embedding. Raise if gate collapses to 0;
+# lower if model ignores host accuracy.
+eta   = 0.1   # Adaptive capacity maximisation
+
+# ---------------------------------------------------------------------------
+# Training loop
+# ---------------------------------------------------------------------------
+
+[training]
+max_epochs            = 500
+batch_size            = 64
+monitor               = "val_payload_accuracy"
+monitor_mode          = "max"
+checkpoint_constraint_metric = "val_host_accuracy"
+checkpoint_constraint_minimum = 0.90
+minimum_host_accuracy = 0.50
+# Raised from 1e-4 -> 2e-3. At the old rate, real (fixed-architecture)
+# learning was measurably happening but far too slowly to be practical —
+# ~1.36 percentage points of movement over 50 epochs. Since you're
+# currently running a payload-only warm-up (other loss weights at 0),
+# there's no competing objective to destabilize, so it's safe to be
+# aggressive here. Pull this back down once you reintroduce
+# classification/distortion/detector losses.
+learning_rate         = 2.0e-4
+# Slightly lower than pure payload-only (2e-3) but higher than fixed
+# multi-objective (5e-4): the curriculum warm-up phase (alpha=0) means the
+# first N epochs are effectively single-objective, so we can afford a
+# larger initial LR that the cosine schedule decays smoothly.
+weight_decay          = 1.0e-5
+gradient_clip_norm    = 0.5
+# Was 1.0. Tightened after observing a single-batch instability spike around
+# epoch 104 of a 400-epoch run (train_loss 0.608 -> 0.644 in one epoch, ~10
+# epochs to recover) on the small 461-sample synthetic dataset. Clipping
+# bounds the update magnitude but not direction — a tighter norm reduces how
+# hard one outlier gradient can push the optimizer off course. If this
+# turns out to slow legitimate convergence too much, 0.75 is a reasonable
+# middle ground to try next.
+# Enabled by default: roughly halves activation memory on CUDA, which
+# matters a lot here since the encoder/decoder/detector process the full
+# weight-image resolution.
+mixed_precision       = true
+
+# Number of full-resolution encoder/decoder/detector forward passes per
+# step. This is INDEPENDENT of batch_size above: batch_size controls how
+# many images are classified per step (cheap), while payload_replicas
+# controls how many times the encoder's CNN runs over the ENTIRE weight
+# image (expensive — memory scales with this, not with batch_size, since
+# only one modified-weight replica is ever used for classification).
+# On limited-VRAM GPUs (e.g. 4-8GB laptop/consumer cards), keep this at 1-2
+# regardless of how large batch_size is.
+payload_replicas      = 1
+
+# LR scheduler: "cosine" | "step" | "reduce_on_plateau"
+scheduler             = "cosine"
+# scheduler_t_max intentionally NOT set here. CosineAnnealingLR is periodic
+# past T_max (it does NOT clamp at the minimum — it keeps evaluating the
+# same cosine curve, so a mismatched T_max causes LR to ramp back up to full
+# strength mid-run, repeating every T_max epochs like an unintended warm
+# restart). Previously hardcoded to 50 here, which silently overrode
+# scripts/train.py's own default (max_epochs) on every run regardless of
+# --epochs, causing a real instability spike around epoch 80 of a 100-epoch
+# run (LR climbing back to ~65% of max right when it should have been near
+# zero). Leave unset so it always resolves to max_epochs -> exactly one
+# smooth decay across whatever run length you choose. Set explicitly only
+# if you deliberately want periodic warm-restart-style cycling.
+scheduler_step_size   = 10      # StepLR step
+scheduler_gamma       = 0.5     # StepLR / ReduceLROnPlateau decay factor
+
+# Set to null to disable early stopping.
+early_stopping_patience = 50
+# Curriculum: linearly ramp alpha from 0 → target over this many epochs.
+# The encoder first learns to embed the payload aggressively (unconstrained);
+# then as alpha ramps up, the classification gradient forces it to find
+# more subtle embeddings. With reference_decoding=True, even tiny residuals
+# give perfect payload recovery, so the encoder can freely shrink its
+# effective delta magnitude to satisfy the accuracy objective without
+# sacrificing payload BER. 0 = no curriculum (alpha fixed from epoch 1).
+alpha_warmup_epochs   = 0
+
+# Curriculum: alpha linearly ramps 0 -> 1.0 over the first N epochs.
+# Phase 1 (epochs 1..N): embed aggressively, no accuracy pressure.
+# Phase 2 (epochs N+1..max_epochs): full multi-objective.
+# Set to 0 to disable warmup (use fixed alpha from epoch 1).
+# Was 10. Seen empirically: a single hard/outlier batch (461-sample synthetic
+# dataset, ~29 steps/epoch, fresh random 1,048,576-bit payload every step —
+# very little epoch-to-epoch averaging to smooth out one bad batch) can spike
+# val_loss for several epochs while Adam's per-parameter second-moment
+# estimates settle back down. Observed one such spike take ~10 epochs to
+# recover, monotonically, without yet beating the pre-spike best — patience
+# of 10 stopped training mid-recovery on a run that was otherwise still
+# improving. This is NOT the same issue as the earlier scheduler_t_max bug
+# (LR was confirmed near-constant across that spike); it's just Adam
+# reacting to one hard batch on a very small, high-variance dataset.
+
+log_every_n_steps     = 10
+save_best_only        = false
+
+# ---------------------------------------------------------------------------
+# Outputs
+# ---------------------------------------------------------------------------
+
+[outputs]
+root        = "outputs"
+logs        = "outputs/logs"
+figures     = "outputs/figures"
+metrics     = "outputs/metrics"
+checkpoints = "outputs/checkpoints"
+tensorboard = "outputs/tensorboard"
+
+# ---------------------------------------------------------------------------
+# Evaluation
+# ---------------------------------------------------------------------------
+
+[evaluation]
+# Number of samples used in the evaluation script.
+num_eval_samples = 64
+
+# Detector: path to SRNet weights and FSL centroids.
+# Leave empty ("") to use the fallback statistical detector.
+srnet_weights_path = ""
+centroid_path      = ""
+
+# Metrics reported in the evaluation summary.
+metrics = [
+    "accuracy_drop",
+    "payload_recovery",
+    "bit_error_rate",
+    "model_xray_detection_rate",
+    "embedding_capacity",
+]
+
+# ---------------------------------------------------------------------------
+# Standalone SRNet / FSL detector  (used by scripts/run_demo.py and
+# evaluation/fsl_detector.py)
+# ---------------------------------------------------------------------------
+
+[srnet_detector]
+# Input GF image side length (pixels).  SRNet expects 256×256.
+imsize = 256
+
+# Dimensionality of the L2-normalised SRNet output embedding.
+embedding_dim = 512
+
+# Margin α for the triplet loss: L = max(d(A,P) - d(A,N) + α, 0).
+triplet_margin = 0.5
+
+# Adam learning rate for SRNet FSL fine-tuning.
+fsl_lr = 6e-5
+
+# Number of triplet-loss training epochs.
+fsl_epochs = 50
+
+# Triplet batch size.
+fsl_batch_size = 32
+
+# Classifier after embedding: "centroid" (Nearest Centroid) or "1nn" (1-NN).
+classifier = "centroid"
+
+# Number of benign model checkpoints to generate for FSL training.
+num_benign_samples = 5
+
+# Number of malicious (payload-embedded) model checkpoints to generate.
+num_malicious_samples = 5

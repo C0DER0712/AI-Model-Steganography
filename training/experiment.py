@@ -212,11 +212,15 @@ class SteganographyExperiment:
                     "Check --host-checkpoint, class count, and data transforms "
                     "before starting embedding."
                 )
+        encoder_params = sum(p.numel() for p in pipeline.encoder.parameters())
+        decoder_params = sum(p.numel() for p in pipeline.decoder.parameters())
         logger.info(
-            "Pipeline built: host=%s, encoder params=%d, decoder params=%d",
+            "Pipeline built: host=%s, encoder params=%d, decoder params=%d, "
+            "encoder+decoder=%d / 1,000,000",
             cfg.pipeline.host_model_name,
-            sum(p.numel() for p in pipeline.encoder.parameters()),
-            sum(p.numel() for p in pipeline.decoder.parameters()),
+            encoder_params,
+            decoder_params,
+            encoder_params + decoder_params,
         )
 
         # ---- Build loss ----

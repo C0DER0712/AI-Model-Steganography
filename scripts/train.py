@@ -300,6 +300,8 @@ def main(argv: list[str] | None = None) -> int:
     # Higher values multiply capacity: bpp=4 -> ~1.1MB / 12.5% embed rate.
     # Must be identical in encoder and decoder configs.
     bits_per_pixel = enc_sec.get("bits_per_pixel", dec_sec.get("bits_per_pixel", 1))
+    pipeline_sec = file_cfg.get("pipeline", {})
+    reference_decoding = pipeline_sec.get("reference_decoding", True)
 
     encoder_cfg = EncoderConfig(
         payload_dim=payload_bits,
@@ -316,6 +318,7 @@ def main(argv: list[str] | None = None) -> int:
         adaptive_capacity=enc_sec.get("adaptive_capacity", False),
     )
     decoder_cfg = DecoderConfig(
+        input_channels=1 if reference_decoding else 2,
         base_channels=dec_sec.get("base_channels", 64),
         num_residual_blocks=dec_sec.get("num_residual_blocks", 4),
         attention_reduction=dec_sec.get("attention_reduction", 8),
@@ -324,7 +327,6 @@ def main(argv: list[str] | None = None) -> int:
     )
 
     # ---- Build pipeline config ----
-    pipeline_sec = file_cfg.get("pipeline", {})
     host_checkpoint = _resolve(args.host_checkpoint, host_sec.get("checkpoint"), None)
     pipeline_cfg = PipelineConfig(
         host_model_name=_resolve(args.host_model, host_sec.get("name"), "resnet18"),
@@ -338,10 +340,8 @@ def main(argv: list[str] | None = None) -> int:
         payload_replicas=_resolve(args.payload_replicas, train_sec.get("payload_replicas"), 1),
         encoder=encoder_cfg,
         decoder=decoder_cfg,
-        # Reference-based decoding: decoder receives (modified - original) instead
-        # of the raw modified representation. See PipelineConfig.reference_decoding.
-        # Default True — the correct permanent design for keyed model steganography.
-        reference_decoding=pipeline_sec.get("reference_decoding", True),
+        # Blind mode trains the decoder on normalized modified weights alone.
+        reference_decoding=reference_decoding,
     )
 
     # ---- Build loss weights ----

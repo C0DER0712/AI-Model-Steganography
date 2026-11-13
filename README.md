@@ -6,8 +6,8 @@ This repository is initialized for defensive AI security research on evaluating 
 
 - Defensive research only.
 - Random benign payloads only.
-- No ML models are implemented in this initialization.
-- Future work should keep model code, training loops, evaluation logic, and utility code modular.
+- The repository includes host-model, embedding, decoding, training, and evaluation code.
+- Keep payloads benign and use the code only for defensive research.
 
 ## Research Context
 
@@ -15,6 +15,35 @@ The project is informed by:
 
 - `papers/Evil_Model.pdf`: neural-network weight steganography threat context, embedding capacity, performance impact, and countermeasure motivation.
 - `papers/Model_X_ray.pdf`: detector context using model-weight image representations and few-shot steganalysis.
+
+## Blind-decoder experiment
+
+The `configs/experiment_blind.toml` configuration selects blind decoding. Its
+multi-scale reveal CNN sees only normalized modified weights plus a fixed
+local high-pass feature; dilated residual blocks increase context without
+increasing parameter count. It never receives the clean representation. The provided configuration
+starts at 128 KB because blind extraction is a harder objective than decoding a
+clean-subtracted residual. Train a new checkpoint for this mode; checkpoints
+trained with reference decoding are not compatible. The pipeline enforces a
+combined encoder/decoder budget of 1,000,000 trainable parameters (the provided
+configuration uses 170,606).
+
+Example training command (replace the host checkpoint and data root with your
+own paths):
+
+```bash
+python scripts/train.py \
+  --config configs/experiment_blind.toml \
+  --host-checkpoint /path/to/mobilenet_v2_cifar10.pt \
+  --data-root /path/to/cifar10 \
+  --output-dir outputs/blind_128kb
+```
+
+For receiver-side extraction, `scripts/decode_blind.py` takes the trained
+experiment checkpoint and the **modified** host model checkpoint. It does not
+take a clean host checkpoint. The modified model must use the same architecture,
+class count, and learnable-parameter ordering used during training. This is a
+new experimental path, not yet a validated recovery result.
 
 ## Structure
 

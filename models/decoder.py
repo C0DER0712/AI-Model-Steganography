@@ -34,6 +34,7 @@ import torch
 from torch import nn
 from torch.nn import functional as F
 
+from utils.representation import weights_to_float_image
 from utils.payload import tensor_to_payload
 
 
@@ -42,10 +43,10 @@ class DecoderConfig:
     """Configuration for `DensePayloadDecoder`.
 
     Attributes:
-        input_channels: Number of input representation channels. Under the
-            float32 representation the decoder receives the single-channel
-            pure perturbation ``modified_float - original_float`` (see
-            ``PipelineConfig.reference_decoding``), so this is 1.
+        input_channels: Decoder feature channels. Reference decoding uses one
+            channel (the clean-subtracted perturbation); blind decoding uses
+            two channels (normalized modified weights and their local
+            high-pass residual), selected by ``PipelineConfig``.
         base_channels: Width of the convolutional feature extractor.
         num_residual_blocks: Number of residual CNN blocks in the extractor.
         attention_reduction: Reduction ratio for channel attention.
@@ -76,9 +77,12 @@ class DecoderConfig:
 class ConvNormActivation(nn.Module):
     """Convolution block: Conv2d -> GroupNorm -> GELU."""
 
-    def __init__(self, in_channels: int, out_channels: int, kernel_size: int = 3) -> None:
+    def __init__(
+        self, in_channels: int, out_channels: int, kernel_size: int = 3,
+        dilation: int = 1,
+    ) -> None:
         super().__init__()
-        padding = kernel_size // 2
+        padding = dilation * (kernel_size // 2)
 
         # Conv2d learns local structure in the single-channel float residual.
         self.conv = nn.Conv2d(
@@ -86,6 +90,7 @@ class ConvNormActivation(nn.Module):
             out_channels,
             kernel_size=kernel_size,
             padding=padding,
+            dilation=dilation,
             bias=False,
         )
         # GroupNorm keeps behavior stable for small research batch sizes.
@@ -128,13 +133,15 @@ class ChannelAttention(nn.Module):
 class ResidualDecoderBlock(nn.Module):
     """Residual CNN block for extracting payload-reconstruction evidence."""
 
-    def __init__(self, channels: int, attention_reduction: int) -> None:
+    def __init__(
+        self, channels: int, attention_reduction: int, dilation: int = 1
+    ) -> None:
         super().__init__()
 
         # First convolution extracts local evidence from byte-plane features.
-        self.conv1 = ConvNormActivation(channels, channels)
+        self.conv1 = ConvNormActivation(channels, channels, dilation=dilation)
         # Second convolution refines evidence before residual addition.
-        self.conv2 = ConvNormActivation(channels, channels)
+        self.conv2 = ConvNormActivation(channels, channels, dilation=dilation)
         # ChannelAttention learns which feature channels matter for decoding.
         self.attention = ChannelAttention(channels, attention_reduction)
 
@@ -169,8 +176,12 @@ class DensePayloadDecoder(nn.Module):
                 ResidualDecoderBlock(
                     channels=config.base_channels,
                     attention_reduction=config.attention_reduction,
+                    # Blind decoding must distinguish payload edits from
+                    # structured host-weight content. Exponentially spaced
+                    # dilation adds broad context without extra parameters.
+                    dilation=(min(2 ** index, 8) if config.input_channels == 2 else 1),
                 )
-                for _ in range(config.num_residual_blocks)
+                for index in range(config.num_residual_blocks)
             ]
         )
         # 1x1 conv down to bits_per_pixel channels: each channel is an
@@ -198,6 +209,7 @@ class DensePayloadDecoder(nn.Module):
             Callers slice to `[:, :num_bits]` to drop grid padding.
         """
 
+        weight_representation = self._prepare_input(weight_representation)
         self._validate_inputs(weight_representation, num_bits)
 
         # Mirror the encoder guard: disable autocast so that the large
@@ -236,6 +248,51 @@ class DensePayloadDecoder(nn.Module):
         logits = pooled.permute(0, 2, 3, 1).reshape(pooled.shape[0], grid_side * grid_side * bpp)
 
         return logits.to(dtype=original_dtype) if original_dtype.is_floating_point else logits
+
+    def _prepare_input(self, weight_representation: torch.Tensor) -> torch.Tensor:
+        """Build blind-decoder features from a single normalized weight image.
+
+        The two-channel blind input retains the absolute normalized weights
+        and adds a fixed 5x5 local high-pass residual. This gives the reveal
+        network both carrier context and a feature that emphasizes small
+        local edits. The transform is deterministic and requires no clean
+        reference model.
+        """
+        if weight_representation.ndim != 4:
+            return weight_representation
+        expected = self.config.input_channels
+        actual = weight_representation.shape[1]
+        if actual == expected:
+            return weight_representation
+        if expected == 2 and actual == 1:
+            local_mean = F.avg_pool2d(
+                weight_representation.float(), kernel_size=5, stride=1,
+                padding=2, count_include_pad=False,
+            )
+            return torch.cat(
+                (weight_representation.float(), weight_representation.float() - local_mean),
+                dim=1,
+            )
+        return weight_representation
+
+    @torch.no_grad()
+    def decode_flat_weights(
+        self,
+        modified_weights: torch.Tensor,
+        num_bits: int,
+        threshold: float = 0.0,
+    ) -> torch.Tensor:
+        """Blindly decode directly from flattened modified model weights.
+
+        ``modified_weights`` must contain only the learnable float32 weights
+        in the same deterministic order used by ``extract_parameters``. No
+        clean/reference checkpoint or reference normalization statistics are
+        accepted or needed.
+        """
+        image, _ = weights_to_float_image(modified_weights)
+        device = next(self.parameters()).device
+        representation = torch.from_numpy(image).unsqueeze(0).to(device)
+        return self.decode(representation, num_bits, threshold=threshold)
 
     @torch.no_grad()
     def decode(
