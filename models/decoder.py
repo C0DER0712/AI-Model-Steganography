@@ -72,6 +72,9 @@ class DecoderConfig:
     # Experimental blind path: compute a gate from modified weights inside
     # the decoder and provide it as a feature channel. No clean weights enter.
     use_capacity_gate: bool = False
+    # Defaults to one quarter of the decoder width (minimum 8). PipelineConfig
+    # aligns this with the encoder gate when the two gates share initialization.
+    capacity_gate_hidden_channels: int | None = None
 
 
 class ConvNormActivation(nn.Module):
@@ -167,8 +170,13 @@ class DensePayloadDecoder(nn.Module):
         super().__init__()
         _validate_config(config)
         self.config = config
+        gate_hidden_channels = config.capacity_gate_hidden_channels or max(
+            8, config.base_channels // 4
+        )
         self.capacity_gate = (
-            AdaptiveCapacityGate(input_channels=1)
+            AdaptiveCapacityGate(
+                input_channels=1, hidden_channels=gate_hidden_channels
+            )
             if config.use_capacity_gate else None
         )
 
