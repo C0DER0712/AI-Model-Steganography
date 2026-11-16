@@ -88,7 +88,11 @@ class PipelineConfig:
             object.__setattr__(self, "decoder", DecoderConfig())
         if self.detector is None:
             object.__setattr__(self, "detector", DifferentiableDetectorConfig())
-        expected_decoder_channels = 1 if self.reference_decoding else 2
+        expected_decoder_channels = (
+            1 if self.reference_decoding
+            else 3 if self.decoder.use_capacity_gate
+            else 2
+        )
         if self.decoder.input_channels != expected_decoder_channels:
             object.__setattr__(
                 self, "decoder",
@@ -127,6 +131,17 @@ class EmbeddingPipeline(nn.Module):
             )
         self.encoder: WeightPayloadEncoder = build_encoder(cfg.encoder)
         self.decoder: DensePayloadDecoder = build_decoder(cfg.decoder)
+        # Initialize the decoder-side gate from the encoder's learned
+        # safe-location gate, then train it on modified weights only. Keep it
+        # separate so blind decoding needs no clean host model.
+        if (
+            cfg.decoder.use_capacity_gate
+            and self.encoder.capacity_gate is not None
+            and self.decoder.capacity_gate is not None
+        ):
+            self.decoder.capacity_gate.load_state_dict(
+                self.encoder.capacity_gate.state_dict()
+            )
         trainable_payload_params = sum(
             parameter.numel()
             for module in (self.encoder, self.decoder)
