@@ -695,15 +695,8 @@ def _pipeline_config_for_evaluation(
     detector_values.update(saved.get("detector") or {})
     encoder = make_config(EncoderConfig, encoder_values, payload_dim=payload_bits)
     decoder = make_config(DecoderConfig, decoder_values)
-    reference_decoding = saved.get(
-        "reference_decoding", inferred_decoder.get("input_channels", 1) == 1
-    )
-    if not reference_decoding:
-        expected_channels = 3 if decoder.use_capacity_gate else 2
-        if decoder.input_channels != expected_channels:
-            decoder = make_config(
-                DecoderConfig, decoder_values, input_channels=expected_channels
-            )
+    if not saved.get("reference_decoding", True) and decoder.input_channels != 2:
+        decoder = make_config(DecoderConfig, decoder_values, input_channels=2)
     if encoder.bits_per_pixel != decoder.bits_per_pixel:
         raise ValueError(
             "Checkpoint/config disagrees on bits_per_pixel: "
@@ -726,7 +719,6 @@ def _pipeline_config_for_evaluation(
         "encoder": encoder,
         "decoder": decoder,
         "detector": detector,
-        "reference_decoding": reference_decoding,
     })
     return PipelineConfig(**arguments)
 
@@ -789,9 +781,6 @@ def _infer_encoder_decoder_config(state: dict) -> tuple[dict, dict]:
         "num_residual_blocks": block_count("decoder"),
         "attention_reduction": attention_reduction("decoder", "attention.reduce"),
         "bits_per_pixel": projection[0] if projection else 1,
-        "use_capacity_gate": any(
-            key.startswith("decoder.capacity_gate.") for key in state
-        ),
     }
     return encoder, decoder
 
@@ -859,15 +848,13 @@ def _pipeline_config_from_toml(
         adaptive_capacity=encoder_values.get("adaptive_capacity", False),
     )
     reference_decoding = pipeline_values.get("reference_decoding", True)
-    decoder_use_capacity_gate = decoder_values.get("use_capacity_gate", False)
     decoder = DecoderConfig(
-        input_channels=(1 if reference_decoding else 3 if decoder_use_capacity_gate else 2),
+        input_channels=1 if reference_decoding else 2,
         base_channels=decoder_values.get("base_channels", 64),
         num_residual_blocks=decoder_values.get("num_residual_blocks", 4),
         attention_reduction=decoder_values.get("attention_reduction", 8),
         gradient_checkpointing=decoder_values.get("gradient_checkpointing", False),
         bits_per_pixel=bpp,
-        use_capacity_gate=decoder_use_capacity_gate,
     )
     detector = DifferentiableDetectorConfig(
         **{

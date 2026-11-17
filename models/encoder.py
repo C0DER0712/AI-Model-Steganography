@@ -63,11 +63,10 @@ class AdaptiveCapacityGate(nn.Module):
     layers matter.
 
     At training time the gate is continuous (differentiable Sigmoid).
-    The encoder computes this mask from clean weights while embedding. A
-    blind receiver cannot directly access that clean-input mask. The optional
-    decoder-side experiment therefore predicts a separate mask from modified
-    weights and feeds that estimate into the reveal network; it must be
-    learned and evaluated as part of the blind decoder.
+    At inference time threshold at 0.5 for a hard binary decision:
+    if g > 0.5 the bit is embedded; otherwise it is left unembedded and
+    the receiver knows not to decode that position (via the near-zero
+    residual signal it sees through reference_decoding).
     """
 
     def __init__(self, input_channels=1, hidden_channels=16):

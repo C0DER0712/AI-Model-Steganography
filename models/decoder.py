@@ -34,7 +34,6 @@ import torch
 from torch import nn
 from torch.nn import functional as F
 
-from models.encoder import AdaptiveCapacityGate
 from utils.representation import weights_to_float_image
 from utils.payload import tensor_to_payload
 
@@ -46,8 +45,8 @@ class DecoderConfig:
     Attributes:
         input_channels: Decoder feature channels. Reference decoding uses one
             channel (modified minus clean representation). Blind decoding uses
-            modified weights and local detail, plus an optional gate predicted
-            from modified weights inside the decoder.
+            normalized modified weights and a local high-pass detail channel;
+            the pipeline selects the input layout.
         base_channels: Width of the convolutional feature extractor.
         num_residual_blocks: Number of residual CNN blocks in the extractor.
         attention_reduction: Reduction ratio for channel attention.
@@ -69,9 +68,6 @@ class DecoderConfig:
     # increase the bit density in either mode and make recovery harder.
     # Requires encoder.bits_per_pixel to match this value exactly.
     bits_per_pixel: int = 1
-    # Experimental blind path: compute a gate from modified weights inside
-    # the decoder and provide it as a feature channel. No clean weights enter.
-    use_capacity_gate: bool = False
 
 
 class ConvNormActivation(nn.Module):
@@ -167,10 +163,6 @@ class DensePayloadDecoder(nn.Module):
         super().__init__()
         _validate_config(config)
         self.config = config
-        self.capacity_gate = (
-            AdaptiveCapacityGate(input_channels=1)
-            if config.use_capacity_gate else None
-        )
 
         # Stem projects the single float channel into a learned feature space.
         self.stem = ConvNormActivation(config.input_channels, config.base_channels)
@@ -183,7 +175,7 @@ class DensePayloadDecoder(nn.Module):
                     # Blind decoding must distinguish payload edits from
                     # structured host-weight content. Exponentially spaced
                     # dilation adds broad context without extra parameters.
-                    dilation=(min(2 ** index, 8) if config.input_channels >= 2 else 1),
+                    dilation=(min(2 ** index, 8) if config.input_channels == 2 else 1),
                 )
                 for index in range(config.num_residual_blocks)
             ]
@@ -255,11 +247,11 @@ class DensePayloadDecoder(nn.Module):
     def _prepare_input(self, weight_representation: torch.Tensor) -> torch.Tensor:
         """Build blind-decoder features from a single normalized weight image.
 
-        Blind input retains normalized modified weights and adds a fixed 5x5
-        local-detail channel. In the optional gate experiment, the decoder's
-        own AdaptiveCapacityGate predicts a mask from those same modified
-        weights and appends it as a feature channel. No clean representation
-        enters this path.
+        The two-channel blind input retains the normalized modified weights
+        and adds a fixed 5x5 local-detail channel (weight minus local mean).
+        This gives the reveal network both carrier context and a feature that
+        emphasizes small local edits. It is not modified-minus-clean
+        subtraction and requires no clean reference model.
         """
         if weight_representation.ndim != 4:
             return weight_representation
@@ -267,17 +259,16 @@ class DensePayloadDecoder(nn.Module):
         actual = weight_representation.shape[1]
         if actual == expected:
             return weight_representation
-        if expected >= 2 and actual == 1:
+        if expected == 2 and actual == 1:
             local_mean = F.avg_pool2d(
                 weight_representation.float(), kernel_size=5, stride=1,
                 padding=2, count_include_pad=False,
             )
             local_detail = weight_representation.float() - local_mean
-            features = [weight_representation.float(), local_detail]
-            if self.config.use_capacity_gate:
-                assert self.capacity_gate is not None
-                features.append(self.capacity_gate(weight_representation.float()))
-            return torch.cat(features, dim=1)
+            return torch.cat(
+                (weight_representation.float(), local_detail),
+                dim=1,
+            )
         return weight_representation
 
     @torch.no_grad()

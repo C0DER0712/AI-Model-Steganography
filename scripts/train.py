@@ -302,7 +302,6 @@ def main(argv: list[str] | None = None) -> int:
     bits_per_pixel = enc_sec.get("bits_per_pixel", dec_sec.get("bits_per_pixel", 1))
     pipeline_sec = file_cfg.get("pipeline", {})
     reference_decoding = pipeline_sec.get("reference_decoding", True)
-    decoder_use_capacity_gate = dec_sec.get("use_capacity_gate", False)
 
     encoder_cfg = EncoderConfig(
         payload_dim=payload_bits,
@@ -319,13 +318,12 @@ def main(argv: list[str] | None = None) -> int:
         adaptive_capacity=enc_sec.get("adaptive_capacity", False),
     )
     decoder_cfg = DecoderConfig(
-        input_channels=(1 if reference_decoding else 3 if decoder_use_capacity_gate else 2),
+        input_channels=1 if reference_decoding else 2,
         base_channels=dec_sec.get("base_channels", 64),
         num_residual_blocks=dec_sec.get("num_residual_blocks", 4),
         attention_reduction=dec_sec.get("attention_reduction", 8),
         gradient_checkpointing=dec_sec.get("gradient_checkpointing", False),
         bits_per_pixel=bits_per_pixel,
-        use_capacity_gate=decoder_use_capacity_gate,
     )
 
     # ---- Build pipeline config ----

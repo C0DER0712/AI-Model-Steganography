@@ -176,11 +176,9 @@ bits_per_pixel     = 4
 # feature extractor down to ONE output channel (a dense bit-logit map),
 # mildly pooled to the payload grid resolution. Every setting below only
 # controls the feature extractor's depth/width, exactly like a normal CNN.
-# Blind mode provides normalized modified weights and local detail. This
-# experiment adds a third channel: a gate recomputed from modified weights
-# inside the decoder. The receiver does not provide clean weights.
-input_channels     = 3
-use_capacity_gate  = true
+# The runtime selects 2 for blind mode: normalized modified weights plus a
+# fixed local-detail channel. It selects 1 only for reference mode.
+input_channels     = 2
 # Matches [encoder] base_channels — no architectural requirement that they
 # be equal, but keeping them matched avoids an unnecessary asymmetry
 # between how much capacity the encoder spends writing evidence in and how
