@@ -783,7 +783,6 @@ def _infer_encoder_decoder_config(state: dict) -> tuple[dict, dict]:
 
     decoder_stem = shape("decoder.stem.conv.weight")
     projection = shape("decoder.logit_projection.weight")
-    decoder_gate_stem = shape("decoder.capacity_gate.net.0.weight")
     decoder = {
         "input_channels": decoder_stem[1] if decoder_stem else 1,
         "base_channels": decoder_stem[0] if decoder_stem else 64,
@@ -792,9 +791,6 @@ def _infer_encoder_decoder_config(state: dict) -> tuple[dict, dict]:
         "bits_per_pixel": projection[0] if projection else 1,
         "use_capacity_gate": any(
             key.startswith("decoder.capacity_gate.") for key in state
-        ),
-        "capacity_gate_hidden_channels": (
-            decoder_gate_stem[0] if decoder_gate_stem else None
         ),
     }
     return encoder, decoder

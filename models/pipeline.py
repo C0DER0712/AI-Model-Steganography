@@ -93,17 +93,10 @@ class PipelineConfig:
             else 3 if self.decoder.use_capacity_gate
             else 2
         )
-        decoder_updates = {}
         if self.decoder.input_channels != expected_decoder_channels:
-            decoder_updates["input_channels"] = expected_decoder_channels
-        if self.decoder.use_capacity_gate and self.encoder.adaptive_capacity:
-            encoder_gate_width = max(8, self.encoder.base_channels // 4)
-            if self.decoder.capacity_gate_hidden_channels != encoder_gate_width:
-                decoder_updates["capacity_gate_hidden_channels"] = encoder_gate_width
-        if decoder_updates:
             object.__setattr__(
                 self, "decoder",
-                replace(self.decoder, **decoder_updates),
+                replace(self.decoder, input_channels=expected_decoder_channels),
             )
 
 
