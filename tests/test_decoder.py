@@ -111,3 +111,47 @@ def test_parameter_count_independent_of_num_bits() -> None:
 
     after = sum(p.numel() for p in decoder.parameters())
     assert after == before
+
+
+def test_gate_conditioned_local_attention_is_blind_and_differentiable() -> None:
+    """The local-attention decoder builds its gate from the supplied stego only."""
+    decoder = DensePayloadDecoder(
+        DecoderConfig(
+            input_channels=2,
+            base_channels=8,
+            num_residual_blocks=1,
+            attention_reduction=4,
+            bits_per_pixel=2,
+            gate_conditioned_local_attention=True,
+            local_attention_dim=4,
+        )
+    )
+    modified_only = torch.randn(1, 1, 24, 24, requires_grad=True)
+    logits = decoder(modified_only, num_bits=32)
+
+    assert logits.shape == (1, 32)
+    logits.square().mean().backward()
+    assert modified_only.grad is not None
+    assert decoder.local_attention is not None
+    assert decoder.local_attention.capacity_gate.net[0].weight.grad is not None
+    assert decoder.local_attention.queries.grad is not None
+
+
+def test_local_attention_parameter_count_is_payload_length_independent() -> None:
+    decoder = DensePayloadDecoder(
+        DecoderConfig(
+            input_channels=2,
+            base_channels=8,
+            num_residual_blocks=1,
+            attention_reduction=4,
+            bits_per_pixel=2,
+            gate_conditioned_local_attention=True,
+            local_attention_dim=4,
+        )
+    )
+    before = sum(parameter.numel() for parameter in decoder.parameters())
+    weights = torch.randn(1, 1, 32, 32)
+    decoder(weights, num_bits=32)
+    decoder(weights, num_bits=128)
+    after = sum(parameter.numel() for parameter in decoder.parameters())
+    assert after == before

@@ -34,6 +34,7 @@ import torch
 from torch import nn
 from torch.nn import functional as F
 
+from models.encoder import AdaptiveCapacityGate
 from utils.representation import weights_to_float_image
 from utils.payload import tensor_to_payload
 
@@ -68,6 +69,11 @@ class DecoderConfig:
     # increase the bit density in either mode and make recovery harder.
     # Requires encoder.bits_per_pixel to match this value exactly.
     bits_per_pixel: int = 1
+    # Experimental blind decoder: local gate-biased cross-attention on the
+    # payload grid. Queries are shared by bit plane, so params do not scale
+    # with payload length. Its gate is estimated from modified weights only.
+    gate_conditioned_local_attention: bool = False
+    local_attention_dim: int = 16
 
 
 class ConvNormActivation(nn.Module):
@@ -151,6 +157,74 @@ class ResidualDecoderBlock(nn.Module):
         return residual + features
 
 
+class GateConditionedLocalAttention(nn.Module):
+    """Attend over nearby payload-grid cells using a blind estimated gate.
+
+    The module first compresses full-resolution CNN features to the payload
+    grid, then each cell attends to its 3x3 neighborhood. Queries are shared
+    across cells and learned per bit plane; there is no N-by-HW attention
+    matrix or per-payload-bit parameter table.
+    """
+
+    def __init__(self, channels: int, bits_per_pixel: int, attention_dim: int):
+        super().__init__()
+        gate_width = max(8, channels // 4)
+        self.capacity_gate = AdaptiveCapacityGate(
+            input_channels=1, hidden_channels=gate_width
+        )
+        self.key = nn.Conv2d(channels, attention_dim, kernel_size=1, bias=False)
+        self.value = nn.Conv2d(channels, attention_dim, kernel_size=1, bias=False)
+        self.queries = nn.Parameter(torch.empty(bits_per_pixel, attention_dim))
+        nn.init.normal_(self.queries, std=attention_dim ** -0.5)
+        hidden = max(8, attention_dim)
+        self.bit_head = nn.Sequential(
+            nn.Linear(attention_dim, hidden),
+            nn.GELU(),
+            nn.Linear(hidden, 1),
+        )
+        self.attention_dim = attention_dim
+
+    @staticmethod
+    def _neighborhoods(features: torch.Tensor) -> torch.Tensor:
+        """Return (batch, cells, 9, channels) 3x3 local feature tokens."""
+        batch, channels, height, width = features.shape
+        unfolded = F.unfold(features, kernel_size=3, padding=1)
+        return (
+            unfolded.reshape(batch, channels, 9, height * width)
+            .permute(0, 3, 2, 1)
+            .contiguous()
+        )
+
+    def forward(
+        self,
+        features: torch.Tensor,
+        modified_weights: torch.Tensor,
+        grid_side: int,
+    ) -> torch.Tensor:
+        batch = features.shape[0]
+        grid_features = F.adaptive_avg_pool2d(
+            features, output_size=(grid_side, grid_side)
+        )
+        key_tokens = self._neighborhoods(self.key(grid_features))
+        value_tokens = self._neighborhoods(self.value(grid_features))
+
+        # This mask is recomputed from the stego weights. The clean host and
+        # encoder-side mask are never inputs to this blind decoder path.
+        gate = self.capacity_gate(modified_weights.float())
+        gate = F.adaptive_avg_pool2d(gate, output_size=(grid_side, grid_side))
+        gate_tokens = self._neighborhoods(gate).squeeze(-1).clamp_min(1e-6)
+        gate_bias = gate_tokens.log().unsqueeze(2)  # (B, cells, 1, 9)
+
+        scale = self.attention_dim ** -0.5
+        attention_logits = torch.einsum(
+            "bcnd,pd->bcpn", key_tokens, self.queries
+        ) * scale
+        attention = torch.softmax(attention_logits + gate_bias, dim=-1)
+        contexts = torch.einsum("bcpn,bcnd->bcpd", attention, value_tokens)
+        logits = self.bit_head(contexts).squeeze(-1)
+        return logits.reshape(batch, grid_side * grid_side * self.queries.shape[0])
+
+
 class DensePayloadDecoder(nn.Module):
     """Decode payload bits from modified Model-XRay weight representations.
 
@@ -179,6 +253,14 @@ class DensePayloadDecoder(nn.Module):
                 )
                 for index in range(config.num_residual_blocks)
             ]
+        )
+        self.local_attention = (
+            GateConditionedLocalAttention(
+                channels=config.base_channels,
+                bits_per_pixel=config.bits_per_pixel,
+                attention_dim=config.local_attention_dim,
+            )
+            if config.gate_conditioned_local_attention else None
         )
         # 1x1 conv down to bits_per_pixel channels: each channel is an
         # independent dense logit map for one bit-plane.  With bpp=1
@@ -227,12 +309,19 @@ class DensePayloadDecoder(nn.Module):
                 features = block(features)
 
         bpp = self.config.bits_per_pixel
-        logit_map = self.logit_projection(features)  # (batch, bpp, H, W)
 
         # Pool down to the per-bit-plane grid resolution.  For bpp=1 the
         # total payload bits equal grid_side².  For bpp>1, each grid cell
         # carries bpp bits, so grid_side = ceil(sqrt(num_bits / bpp)).
         grid_side = math.ceil(math.sqrt(num_bits / bpp))
+        if self.local_attention is not None:
+            logits = self.local_attention(
+                features,
+                weight_representation[:, :1],
+                grid_side,
+            )
+            return logits.to(dtype=original_dtype)
+        logit_map = self.logit_projection(features)  # (batch, bpp, H, W)
         pooled = F.adaptive_avg_pool2d(logit_map, output_size=(grid_side, grid_side))
         # pooled: (batch, bpp, grid_side, grid_side)
         # Interleave: each spatial cell's bpp logits are adjacent in the
@@ -429,3 +518,5 @@ def _validate_config(config: DecoderConfig) -> None:
         raise ValueError("num_residual_blocks must be non-negative.")
     if config.attention_reduction <= 0:
         raise ValueError("attention_reduction must be positive.")
+    if config.local_attention_dim <= 0:
+        raise ValueError("local_attention_dim must be positive.")

@@ -103,7 +103,7 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     )
     parser.add_argument(
         "--payload-size",
-        choices=["128KB", "256KB", "512KB", "1MB"],
+        choices=["64KB", "128KB", "256KB", "512KB", "1MB"],
         default="128KB",
     )
     parser.add_argument(
@@ -695,7 +695,10 @@ def _pipeline_config_for_evaluation(
     detector_values.update(saved.get("detector") or {})
     encoder = make_config(EncoderConfig, encoder_values, payload_dim=payload_bits)
     decoder = make_config(DecoderConfig, decoder_values)
-    if not saved.get("reference_decoding", True) and decoder.input_channels != 2:
+    reference_decoding = saved.get(
+        "reference_decoding", inferred_decoder.get("input_channels", 1) == 1
+    )
+    if not reference_decoding and decoder.input_channels != 2:
         decoder = make_config(DecoderConfig, decoder_values, input_channels=2)
     if encoder.bits_per_pixel != decoder.bits_per_pixel:
         raise ValueError(
@@ -719,6 +722,7 @@ def _pipeline_config_for_evaluation(
         "encoder": encoder,
         "decoder": decoder,
         "detector": detector,
+        "reference_decoding": reference_decoding,
     })
     return PipelineConfig(**arguments)
 
@@ -775,12 +779,17 @@ def _infer_encoder_decoder_config(state: dict) -> tuple[dict, dict]:
 
     decoder_stem = shape("decoder.stem.conv.weight")
     projection = shape("decoder.logit_projection.weight")
+    local_key = shape("decoder.local_attention.key.weight")
     decoder = {
         "input_channels": decoder_stem[1] if decoder_stem else 1,
         "base_channels": decoder_stem[0] if decoder_stem else 64,
         "num_residual_blocks": block_count("decoder"),
         "attention_reduction": attention_reduction("decoder", "attention.reduce"),
         "bits_per_pixel": projection[0] if projection else 1,
+        "gate_conditioned_local_attention": any(
+            key.startswith("decoder.local_attention.") for key in state
+        ),
+        "local_attention_dim": local_key[0] if local_key else 16,
     }
     return encoder, decoder
 
@@ -855,6 +864,10 @@ def _pipeline_config_from_toml(
         attention_reduction=decoder_values.get("attention_reduction", 8),
         gradient_checkpointing=decoder_values.get("gradient_checkpointing", False),
         bits_per_pixel=bpp,
+        gate_conditioned_local_attention=decoder_values.get(
+            "gate_conditioned_local_attention", False
+        ),
+        local_attention_dim=decoder_values.get("local_attention_dim", 16),
     )
     detector = DifferentiableDetectorConfig(
         **{

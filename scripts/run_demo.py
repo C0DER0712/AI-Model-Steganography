@@ -123,7 +123,7 @@ def _parse_args(argv: Optional[List[str]] = None) -> argparse.Namespace:
     )
     parser.add_argument(
         "--payload-size",
-        choices=["128KB", "256KB", "512KB", "1MB"],
+        choices=["64KB", "128KB", "256KB", "512KB", "1MB"],
         default=None,
         help="Payload size per training sample.",
     )

@@ -127,6 +127,14 @@ class EmbeddingPipeline(nn.Module):
             )
         self.encoder: WeightPayloadEncoder = build_encoder(cfg.encoder)
         self.decoder: DensePayloadDecoder = build_decoder(cfg.decoder)
+        if (
+            cfg.decoder.gate_conditioned_local_attention
+            and self.encoder.capacity_gate is not None
+            and self.decoder.local_attention is not None
+        ):
+            self.decoder.local_attention.capacity_gate.load_state_dict(
+                self.encoder.capacity_gate.state_dict()
+            )
         trainable_payload_params = sum(
             parameter.numel()
             for module in (self.encoder, self.decoder)

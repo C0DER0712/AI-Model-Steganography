@@ -150,7 +150,7 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     )
     parser.add_argument(
         "--payload-size",
-        choices=["128KB", "256KB", "512KB", "1MB"],
+        choices=["64KB", "128KB", "256KB", "512KB", "1MB"],
         default=None,
         help="Payload size embedded per training sample. (default: 128KB)",
     )
@@ -324,6 +324,10 @@ def main(argv: list[str] | None = None) -> int:
         attention_reduction=dec_sec.get("attention_reduction", 8),
         gradient_checkpointing=dec_sec.get("gradient_checkpointing", False),
         bits_per_pixel=bits_per_pixel,
+        gate_conditioned_local_attention=dec_sec.get(
+            "gate_conditioned_local_attention", False
+        ),
+        local_attention_dim=dec_sec.get("local_attention_dim", 16),
     )
 
     # ---- Build pipeline config ----

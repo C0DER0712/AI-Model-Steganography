@@ -34,7 +34,7 @@ from utils.detector_data import (
 
 
 LOG = logging.getLogger("train_detector")
-_PAYLOAD_BYTES = {"128KB": 128 * 1024, "256KB": 256 * 1024,
+_PAYLOAD_BYTES = {"64KB": 64 * 1024, "128KB": 128 * 1024, "256KB": 256 * 1024,
                   "512KB": 512 * 1024, "1MB": 1024 * 1024}
 
 

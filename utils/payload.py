@@ -15,9 +15,10 @@ import torch
 from torch.utils.data import Dataset
 
 
-PayloadSize = Literal["128KB", "256KB", "512KB", "1MB"]
+PayloadSize = Literal["64KB", "128KB", "256KB", "512KB", "1MB"]
 
 SUPPORTED_PAYLOAD_SIZES: dict[PayloadSize, int] = {
+    "64KB": 64 * 1024,
     "128KB": 128 * 1024,
     "256KB": 256 * 1024,
     "512KB": 512 * 1024,
@@ -29,7 +30,7 @@ def generate_payload(size: PayloadSize | int, seed: int | None = None) -> bytes:
     """Generate a benign random payload.
 
     Args:
-        size: One of `128KB`, `256KB`, `512KB`, `1MB`, or an exact supported
+        size: One of `64KB`, `128KB`, `256KB`, `512KB`, `1MB`, or an exact supported
             size in bytes.
         seed: Optional seed for reproducible research fixtures.
 

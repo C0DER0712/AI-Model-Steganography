@@ -199,13 +199,17 @@ class Trainer:
 
         destination = Path(path).expanduser().resolve()
         destination.parent.mkdir(parents=True, exist_ok=True)
+        checkpoint_config = asdict(self.config)
+        model_config = getattr(self.model, "config", None)
+        if model_config is not None and hasattr(model_config, "encoder"):
+            checkpoint_config["pipeline"] = asdict(model_config)
         checkpoint = {
             "model": self.model.state_dict(),
             "optimizer": self.optimizer.state_dict(),
             "scheduler": self.scheduler.state_dict() if self.scheduler is not None else None,
             "scaler": self.scaler.state_dict(),
             "trainer_state": asdict(self.state),
-            "config": asdict(self.config),
+            "config": checkpoint_config,
             "metrics": dict(metrics or {}),
         }
         torch.save(checkpoint, destination)

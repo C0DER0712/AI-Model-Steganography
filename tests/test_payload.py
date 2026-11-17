@@ -22,10 +22,10 @@ def test_generate_payload_supports_required_sizes(label: str, num_bytes: int) ->
 
 def test_generate_payload_rejects_unsupported_sizes() -> None:
     with pytest.raises(ValueError, match="Unsupported payload size"):
-        generate_payload("64KB")  # type: ignore[arg-type]
+        generate_payload("96KB")  # type: ignore[arg-type]
 
     with pytest.raises(ValueError, match="Unsupported payload size"):
-        generate_payload(64 * 1024)
+        generate_payload(96 * 1024)
 
 
 def test_payload_tensor_round_trip_is_bit_exact() -> None:
